@@ -12,10 +12,6 @@ static constexpr const char *TAG = "sound_level_meter";
 static constexpr float DBFS_OFFSET = 20 * std::log10(std::sqrt(2.0f));
 static constexpr uint32_t AUDIO_BUFFER_DURATION_MS = 20;
 
-// Bound deferred work so a sustained publish backlog cannot grow without limit.
-// Oldest work is dropped first because fresher sensor states are more relevant.
-static constexpr size_t MAX_DEFER_QUEUE_SIZE = 256;
-
 /* SoundLevelMeter */
 
 void SoundLevelMeter::set_update_interval(uint32_t update_interval_ms) {
@@ -57,7 +53,6 @@ uint32_t SoundLevelMeter::ms_to_frames(uint32_t ms) {
 }
 
 void SoundLevelMeter::dump_config() {
-  // P4: use portable width specifiers. size_t -> %zu; uint32_t -> PRIu32.
   ESP_LOGCONFIG(TAG, "Sound Level Meter:");
   ESP_LOGCONFIG(TAG, "  Ring Buffer Size: %zu ms", this->ring_buffer_size_ms_);
   ESP_LOGCONFIG(TAG, "  Warmup Interval: %" PRIu32 " ms", this->warmup_interval_ms_);
@@ -79,6 +74,8 @@ void SoundLevelMeter::dump_config() {
 
 void SoundLevelMeter::setup() {
   this->sort_sensors();
+  this->pending_publish_.assign(this->sensors_.size(), {});
+  this->prefix_scratch_.reserve(8);
 
   this->microphone_source_->add_data_callback([this](const std::vector<uint8_t> &data) {
     auto ring_buffer = this->ring_buffer_weak_.lock();
@@ -87,9 +84,7 @@ void SoundLevelMeter::setup() {
       if (bytes_free < data.size()) {
         static uint32_t last_log = 0;
         if (millis() - last_log > 1000) {
-          this->defer([] {
-            ESP_LOGW(TAG, "Dropping incoming audio chunk because ring buffer is full.");
-          });
+          ESP_LOGW(TAG, "Dropping incoming audio chunk because ring buffer is full.");
           last_log = millis();
         }
         return;
@@ -109,20 +104,25 @@ void SoundLevelMeter::setup() {
 }
 
 void SoundLevelMeter::loop() {
-  // Process no more than 5 items per loop iteration.
-  // This limits per-iteration main-loop work while still draining
-  // deferred state publications fast enough for typical update rates.
-  std::vector<std::function<void()>> tasks;
+  // Publish at most 5 pending sensor updates per loop iteration.
+  uint32_t published = 0;
+  std::vector<std::pair<SoundLevelMeterSensor *, float>> ready;
+  ready.reserve(5);
+
   {
-    uint32_t max_items = 5;
-    std::lock_guard<std::mutex> lock(this->defer_mutex_);
-    for (uint32_t i = 0; i < max_items && !this->defer_queue_.empty(); i++) {
-      tasks.push_back(std::move(this->defer_queue_.front()));
-      this->defer_queue_.pop_front();
+    std::lock_guard<std::mutex> lock(this->publish_mutex_);
+    for (size_t i = 0; i < this->pending_publish_.size() && published < 5; i++) {
+      auto &slot = this->pending_publish_[i];
+      if (!slot.has_value)
+        continue;
+      ready.emplace_back(this->sensors_[i], slot.value);
+      slot.has_value = false;
+      published++;
     }
   }
-  for (auto &f : tasks) {
-    f();
+
+  for (auto &item : ready) {
+    item.first->publish_state(item.second);
   }
 }
 
@@ -131,8 +131,6 @@ void SoundLevelMeter::start() {
   if (this->is_running_.load() || this->task_handle_ != nullptr) {
     return;
   }
-  // Publish "running" under the lock before task creation so a stop request
-  // issued in the brief start window is not lost.
   this->is_pending_stop_.store(false);
   this->is_running_.store(true);
   if (xTaskCreatePinnedToCore(SoundLevelMeter::task, "sound_level_meter", this->task_stack_size_, this,
@@ -146,8 +144,6 @@ void SoundLevelMeter::start() {
 }
 
 void SoundLevelMeter::stop() {
-  // Gate on task existence as well as is_running_, so a stop requested in
-  // the brief start window is honored.
   if ((this->is_running_.load() || this->task_handle_ != nullptr) && !this->is_pending_stop_.load()) {
     this->is_pending_stop_.store(true);
     ESP_LOGD(TAG, "Sound Level Meter stop requested");
@@ -220,18 +216,18 @@ void SoundLevelMeter::task(void *param) {
         process_time += esp_timer_get_time() - process_start;
         process_count += buffers.current().size();
 
+#if defined(ESPHOME_LOG_LEVEL) && ESPHOME_LOG_LEVEL >= ESPHOME_LOG_LEVEL_DEBUG
         if (process_count >= component_update_frames) {
           auto cpu_util = float(process_time) / 1000 / this_->update_interval_ms_;
           auto rb_size = this_->ring_buffer_->available() + this_->ring_buffer_->free();
           auto rb_util = float(rb_size - this_->ring_buffer_stats_free_) / rb_size;
           auto core = xPortGetCoreID();
-          this_->defer([cpu_util, rb_util, core]() {
-            ESP_LOGD(TAG, "CPU (Core %u) Utilization: %.1f%%, Ring Buffer Utilization: %.1f%%", core, cpu_util * 100,
-                     rb_util * 100);
-          });
+          ESP_LOGD(TAG, "CPU (Core %u) Utilization: %.1f%%, Ring Buffer Utilization: %.1f%%", core, cpu_util * 100,
+                   rb_util * 100);
           process_time = process_count = 0;
           this_->ring_buffer_stats_free_ = SIZE_MAX;
         }
+#endif
       }
     }
   }
@@ -253,11 +249,6 @@ void SoundLevelMeter::task(void *param) {
   vTaskDelete(nullptr);
 }
 
-// Arrange sensors so those with the same filter prefix appear consecutively.
-// This lets the component reuse already-filtered buffers across adjacent sensors.
-// NOTE: the ordering key is the Filter* pointer vector, so sharing only happens
-// when sensors reference the SAME filter id; inline filters with identical coeffs
-// are distinct objects and are intentionally not shared (matches documented behavior).
 void SoundLevelMeter::sort_sensors() {
   std::sort(this->sensors_.begin(), this->sensors_.end(), [](SoundLevelMeterSensor *a, SoundLevelMeterSensor *b) {
     return std::lexicographical_compare(a->dsp_filters_.begin(), a->dsp_filters_.end(), b->dsp_filters_.begin(),
@@ -273,12 +264,6 @@ size_t SoundLevelMeter::read_samples(std::vector<float> &data, TickType_t ticks_
   if (samples_read > 0) {
     data.resize(samples_read);
     auto data_as_uint8 = reinterpret_cast<const uint8_t *>(data.data());
-    // In-place reverse unpack: convert from the back so each float write (4 bytes)
-    // does not clobber not-yet-read source bytes. `data` is a float[] of
-    // `samples_read` elements (4*samples_read bytes), while the raw payload is
-    // `bytes_read` bytes; for <=32-bit samples the float buffer is >= the payload,
-    // so the descending dst (stride 4) stays ahead of the descending src.
-    // VERIFY the 16-bit path on real hardware/tests before relying on it.
     for (int i = static_cast<int>(bytes_read) - bytes_per_sample, j = static_cast<int>(samples_read) - 1; i >= 0;
          i -= bytes_per_sample, j--) {
       data[j] = audio::unpack_audio_sample_to_q31(&data_as_uint8[i], bytes_per_sample) / float(INT32_MAX);
@@ -288,7 +273,9 @@ size_t SoundLevelMeter::read_samples(std::vector<float> &data, TickType_t ticks_
 }
 
 void SoundLevelMeter::process(BufferStack<float> &buffers) {
-  std::vector<Filter *> prefix;
+  auto &prefix = this->prefix_scratch_;
+  prefix.clear();
+
   for (auto s : this->sensors_) {
     int i = 0, n = s->dsp_filters_.size(), m = prefix.size();
     while (i < n && i < m && s->dsp_filters_[i] == prefix[i])
@@ -309,12 +296,15 @@ void SoundLevelMeter::process(BufferStack<float> &buffers) {
   }
 }
 
-void SoundLevelMeter::defer(std::function<void()> &&f) {
-  std::lock_guard<std::mutex> lock(this->defer_mutex_);
-  if (this->defer_queue_.size() >= MAX_DEFER_QUEUE_SIZE) {
-    this->defer_queue_.pop_front();
+void SoundLevelMeter::defer_publish_state(SoundLevelMeterSensor *sensor, float state) {
+  std::lock_guard<std::mutex> lock(this->publish_mutex_);
+  for (size_t i = 0; i < this->sensors_.size(); i++) {
+    if (this->sensors_[i] == sensor) {
+      this->pending_publish_[i].value = state;
+      this->pending_publish_[i].has_value = true;
+      return;
+    }
   }
-  this->defer_queue_.push_back(std::move(f));
 }
 
 void SoundLevelMeter::reset() {
@@ -339,16 +329,13 @@ void SoundLevelMeterSensor::set_update_interval(uint32_t update_interval_ms) {
 void SoundLevelMeterSensor::add_dsp_filter(Filter *dsp_filter) { this->dsp_filters_.push_back(dsp_filter); }
 
 void SoundLevelMeterSensor::defer_publish_state(float state) {
-  this->parent_->defer([this, state]() { this->publish_state(state); });
+  this->parent_->defer_publish_state(this, state);
 }
 
 float SoundLevelMeterSensor::adjust_dB(float dB, bool is_rms) {
-  // see: https://dsp.stackexchange.com/a/50947/65262
   if (is_rms)
     dB += DBFS_OFFSET;
 
-  // see: https://invensense.tdk.com/wp-content/uploads/2015/02/AN-1112-v1.1.pdf
-  // dBSPL = dBFS + mic_sensitivity_ref - mic_sensitivity
   if (this->parent_->get_mic_sensitivity().has_value() && this->parent_->get_mic_sensitivity_ref().has_value())
     dB += *this->parent_->get_mic_sensitivity_ref() - *this->parent_->get_mic_sensitivity();
 
@@ -361,8 +348,6 @@ float SoundLevelMeterSensor::adjust_dB(float dB, bool is_rms) {
 /* SoundLevelMeterSensorEq */
 
 void SoundLevelMeterSensorEq::process(std::vector<float> &buffer) {
-  // To reduce precision loss, accumulate a local float sum per buffer and
-  // only merge into the longer-lived double accumulator at the end.
   float local_sum = 0;
   for (int i = 0; i < static_cast<int>(buffer.size()); i++) {
     local_sum += buffer[i] * buffer[i];
@@ -481,8 +466,6 @@ void SoundLevelMeterSensorMin::reset() {
 
 void SoundLevelMeterSensorPeak::process(std::vector<float> &buffer) {
   for (int i = 0; i < static_cast<int>(buffer.size()); i++) {
-    // std::fabs forces the floating-point magnitude. Plain abs() can resolve
-    // to int abs(int) and truncate the sample to 0, destroying the peak.
     this->peak_ = std::max(this->peak_, std::fabs(buffer[i]));
     this->count_++;
     if (this->count_ == this->update_samples_) {
@@ -526,12 +509,6 @@ void SOS_Filter::process(std::vector<float> &data) {
     dsps_biquad_f32_ansi(&data[0], &data[0], data.size(), &this->coeffs_[j][0], &this->state_[j][0]);
 #endif
 #else
-    // Direct Form II Transposed; typically a little more numerically stable.
-    // Coefficient/sign convention: {b0,b1,b2,a1,a2} with a0 normalized to 1 and
-    //   y = b0*x + b1*x1 + b2*x2 - a1*y1 - a2*y2.
-    // This matches esp-dsp's [b0,b1,b2,a1,a2] ordering above. SciPy `sos` rows are
-    // [b0,b1,b2,a0,a1,a2]; drop the a0=1 column (a0 is already normalized) and keep
-    // the same sign to import them.
     for (int i = 0; i < n; i++) {
       float yi = this->coeffs_[j][0] * data[i] + this->state_[j][0];
       this->state_[j][0] = this->coeffs_[j][1] * data[i] - this->coeffs_[j][3] * yi + this->state_[j][1];

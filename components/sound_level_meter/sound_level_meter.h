@@ -1,11 +1,12 @@
 #pragma once
 
 #include <atomic>
-#include <cinttypes>  // PRIu32 for portable dump_config format specifiers (P4)
-#include <cmath>      // std::fabs / std::log10 / std::sqrt — make math overloads explicit (C1)
+#include <cinttypes>
+#include <cmath>
+#include <deque>
 #include <mutex>
 #include <algorithm>
-#include <deque>
+#include <utility>
 
 #include "esp_timer.h"
 
@@ -71,6 +72,11 @@ class SoundLevelMeter : public Component
 #endif
 
  protected:
+  struct PendingPublishState {
+    bool has_value{false};
+    float value{NAN};
+  };
+
   microphone::MicrophoneSource *microphone_source_{nullptr};
   std::vector<Filter *> dsp_filters_;
   std::vector<SoundLevelMeterSensor *> sensors_;
@@ -82,8 +88,8 @@ class SoundLevelMeter : public Component
   optional<float> mic_sensitivity_{};
   optional<float> mic_sensitivity_ref_{};
   optional<float> offset_{};
-  std::deque<std::function<void()>> defer_queue_;
-  std::mutex defer_mutex_;
+  std::mutex publish_mutex_;
+  std::vector<PendingPublishState> pending_publish_;
   uint32_t update_interval_ms_{60000};
   std::atomic<bool> is_running_{false};
   std::atomic<bool> was_running_before_ota_{false};
@@ -96,15 +102,14 @@ class SoundLevelMeter : public Component
   size_t ring_buffer_stats_free_{SIZE_MAX};
   std::mutex task_mutex_;
   TaskHandle_t task_handle_{nullptr};
+  std::vector<Filter *> prefix_scratch_;
 
   audio::AudioStreamInfo get_audio_stream_info() const;
   uint32_t ms_to_frames(uint32_t ms);
   void sort_sensors();
   size_t read_samples(std::vector<float> &data, TickType_t ticks_to_wait = portMAX_DELAY);
   void process(BufferStack<float> &buffers);
-  // ESPHome's scheduler is not thread safe, so use a custom thread-safe queue
-  // to execute sensor updates in the main loop.
-  void defer(std::function<void()> &&f);
+  void defer_publish_state(SoundLevelMeterSensor *sensor, float state);
   void reset();
 
   static void task(void *param);
@@ -198,7 +203,7 @@ class SOS_Filter : public Filter {
   virtual void process(std::vector<float> &data) override;
 
  protected:
-  std::vector<std::array<float, 5>> coeffs_;  // {b0, b1, b2, a1, a2}
+  std::vector<std::array<float, 5>> coeffs_;
   std::vector<std::array<float, 2>> state_;
 
   virtual void reset() override;
