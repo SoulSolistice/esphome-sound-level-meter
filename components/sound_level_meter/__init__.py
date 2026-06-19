@@ -4,18 +4,18 @@ import esphome.codegen as cg
 import esphome.config_validation as cv
 from esphome import automation, core
 from esphome.automation import maybe_simple_id
-from esphome.components import sensor, microphone, ota
+from esphome.components import microphone, ota, sensor
 from esphome.components.esp32 import add_idf_component
 from esphome.const import (
     CONF_ID,
-    CONF_SENSORS,
-    CONF_WINDOW_SIZE,
-    CONF_UPDATE_INTERVAL,
-    CONF_TYPE,
     CONF_MICROPHONE,
-    UNIT_DECIBEL,
-    STATE_CLASS_MEASUREMENT,
+    CONF_SENSORS,
+    CONF_TYPE,
+    CONF_UPDATE_INTERVAL,
+    CONF_WINDOW_SIZE,
     DEVICE_CLASS_SOUND_PRESSURE,
+    STATE_CLASS_MEASUREMENT,
+    UNIT_DECIBEL,
 )
 
 CODEOWNERS = ["@stas-sl"]
@@ -44,7 +44,6 @@ Filter = sound_level_meter_ns.class_("Filter")
 SOS_Filter = sound_level_meter_ns.class_("SOS_Filter", Filter)
 StartAction = sound_level_meter_ns.class_("StartAction", automation.Action)
 StopAction = sound_level_meter_ns.class_("StopAction", automation.Action)
-
 
 CONF_EQ = "eq"
 CONF_MAX = "max"
@@ -163,18 +162,14 @@ def _validate_effective_sensor_intervals(config):
     top_update = config[CONF_UPDATE_INTERVAL]
     for idx, sensor_cfg in enumerate(config[CONF_SENSORS]):
         effective_update = sensor_cfg.get(CONF_UPDATE_INTERVAL, top_update)
-        if effective_update <= 0:
-            raise cv.Invalid(
-                f"Sensor at index {idx} must have an effective {CONF_UPDATE_INTERVAL} greater than 0ms"
-            )
-        if (
-            CONF_WINDOW_SIZE in sensor_cfg
-            and sensor_cfg[CONF_WINDOW_SIZE] > effective_update
-        ):
-            raise cv.Invalid(
-                f"Sensor at index {idx} has {CONF_WINDOW_SIZE} greater than its effective "
-                f"{CONF_UPDATE_INTERVAL}"
-            )
+
+        if CONF_WINDOW_SIZE in sensor_cfg:
+            window_size = sensor_cfg[CONF_WINDOW_SIZE]
+            if window_size > effective_update:
+                raise cv.Invalid(
+                    f"Sensor at index {idx} has {CONF_WINDOW_SIZE} greater than its effective "
+                    f"{CONF_UPDATE_INTERVAL}"
+                )
     return config
 
 
@@ -207,7 +202,7 @@ CONFIG_SCHEMA = cv.All(
             cv.Optional(CONF_OFFSET): cv.decibel,
             cv.Optional(CONF_DSP_FILTERS, default=[]): [CONFIG_DSP_FILTER_SCHEMA],
             cv.Optional(CONF_SENSORS, default=[]): [CONFIG_SENSOR_SCHEMA],
-            cv.Optional(CONF_USE_ESP_DSP, default=False): cv.All(cv.boolean),
+            cv.Optional(CONF_USE_ESP_DSP, default=False): cv.boolean,
         }
     ).extend(cv.COMPONENT_SCHEMA),
     cv.only_on_esp32,

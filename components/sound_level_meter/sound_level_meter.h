@@ -100,8 +100,8 @@ class SoundLevelMeter : public Component
   void sort_sensors();
   size_t read_samples(std::vector<float> &data, TickType_t ticks_to_wait = portMAX_DELAY);
   void process(BufferStack<float> &buffers);
-  // epshome's scheduler is not thred safe, so we have to use custom thread safe implementation
-  // to execute sensor updates in main loop
+  // ESPHome's scheduler is not thread safe, so use a custom thread-safe queue
+  // to execute sensor updates in the main loop.
   void defer(std::function<void()> &&f);
   void reset();
 
@@ -213,7 +213,6 @@ template<typename T> class BufferStack {
 
  private:
   uint32_t buffer_size_;
-  uint32_t max_depth_;
   uint32_t index_{0};
   std::vector<std::vector<T>> buffers_;
 };

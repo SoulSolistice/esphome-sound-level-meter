@@ -12,6 +12,10 @@ static constexpr const char *TAG = "sound_level_meter";
 static constexpr float DBFS_OFFSET = 20 * log10(sqrt(2));
 static constexpr uint32_t AUDIO_BUFFER_DURATION_MS = 20;
 
+// Bound deferred work so a sustained publish backlog cannot grow without limit.
+// Oldest work is dropped first because fresher sensor states are more relevant.
+static constexpr size_t MAX_DEFER_QUEUE_SIZE = 256;
+
 /* SoundLevelMeter */
 
 void SoundLevelMeter::set_update_interval(uint32_t update_interval_ms) {
@@ -102,23 +106,13 @@ void SoundLevelMeter::setup() {
 
 void SoundLevelMeter::loop() {
   // Process no more than 5 items per loop iteration.
-  // When there are many sensors with short update intervals,
-  // a large number of state updates (publish_state) may be queued.
-  // Publishing state is a relatively expensive operation, so calling
-  // it more than 10–20 times per iteration could trigger a warning
-  // that the component is taking too long to operate. Therefore, we
-  // limit the number of updates per iteration. The loop runs approximately
-  // 100 times per second, so any remaining items will be processed
-  // in the next iteration. Processing only one item per iteration is too
-  // restrictive, as in extreme cases with many updates - say,
-  // 100 per second - we might hit performance limits. Thus, we set a maximum
-  // of 5 items per iteration, allowing up to 500 sensor updates per second
-  // in theory, which should be more than sufficient for most scenarios.
+  // This limits per-iteration main-loop work while still draining
+  // deferred state publications fast enough for typical update rates.
   std::vector<std::function<void()>> tasks;
   {
     uint32_t max_items = 5;
     std::lock_guard<std::mutex> lock(this->defer_mutex_);
-    for (int i = 0; i < max_items && !this->defer_queue_.empty(); i++) {
+    for (uint32_t i = 0; i < max_items && !this->defer_queue_.empty(); i++) {
       tasks.push_back(std::move(this->defer_queue_.front()));
       this->defer_queue_.pop_front();
     }
@@ -142,7 +136,7 @@ void SoundLevelMeter::start() {
 void SoundLevelMeter::stop() {
   if (this->is_running_.load() && !this->is_pending_stop_.load()) {
     this->is_pending_stop_.store(true);
-    ESP_LOGD(TAG, "Sound Level Meter stopped");
+    ESP_LOGD(TAG, "Sound Level Meter stop requested");
   }
 }
 
@@ -181,8 +175,9 @@ void SoundLevelMeter::task(void *param) {
       this_->high_freq_.start();
 
     auto warmup_start = millis();
-    while (millis() - warmup_start < this_->warmup_interval_ms_)
+    while (!this_->is_pending_stop_.load() && millis() - warmup_start < this_->warmup_interval_ms_) {
       this_->read_samples(buffers, 2 * pdMS_TO_TICKS(AUDIO_BUFFER_DURATION_MS));
+    }
 
     uint32_t process_time = 0, process_count = 0;
     uint64_t process_start;
@@ -226,6 +221,7 @@ void SoundLevelMeter::task(void *param) {
       }
     }
   }
+
   this_->ring_buffer_.reset();
   this_->microphone_source_->stop();
 
@@ -243,9 +239,8 @@ void SoundLevelMeter::task(void *param) {
   vTaskDelete(nullptr);
 }
 
-// Arranging sensors in a sorted order so that those with the same
-// filters (or prefix) appear consecutively. This enables more efficient
-// computations by applying filters only once for each common prefix of filters
+// Arrange sensors so those with the same filter prefix appear consecutively.
+// This lets the component reuse already-filtered buffers across adjacent sensors.
 void SoundLevelMeter::sort_sensors() {
   std::sort(this->sensors_.begin(), this->sensors_.end(), [](SoundLevelMeterSensor *a, SoundLevelMeterSensor *b) {
     return std::lexicographical_compare(a->dsp_filters_.begin(), a->dsp_filters_.end(), b->dsp_filters_.begin(),
@@ -272,18 +267,15 @@ void SoundLevelMeter::process(BufferStack<float> &buffers) {
   std::vector<Filter *> prefix;
   for (auto s : this->sensors_) {
     int i = 0, n = s->dsp_filters_.size(), m = prefix.size();
-    // finding common prefx
     while (i < n && i < m && s->dsp_filters_[i] == prefix[i])
       i++;
 
-    // discard applied filters beyond common prefix (if any)
-    while (prefix.size() > i) {
+    while (prefix.size() > static_cast<size_t>(i)) {
       prefix.pop_back();
       buffers.pop();
     }
 
-    // apply new filters from current sensor on top of common prefix
-    for (; i < s->dsp_filters_.size(); i++) {
+    for (; i < static_cast<int>(s->dsp_filters_.size()); i++) {
       auto f = s->dsp_filters_[i];
       buffers.push();
       f->process(buffers);
@@ -295,6 +287,9 @@ void SoundLevelMeter::process(BufferStack<float> &buffers) {
 
 void SoundLevelMeter::defer(std::function<void()> &&f) {
   std::lock_guard<std::mutex> lock(this->defer_mutex_);
+  if (this->defer_queue_.size() >= MAX_DEFER_QUEUE_SIZE) {
+    this->defer_queue_.pop_front();
+  }
   this->defer_queue_.push_back(std::move(f));
 }
 
@@ -330,7 +325,6 @@ float SoundLevelMeterSensor::adjust_dB(float dB, bool is_rms) {
 
   // see: https://invensense.tdk.com/wp-content/uploads/2015/02/AN-1112-v1.1.pdf
   // dBSPL = dBFS + mic_sensitivity_ref - mic_sensitivity
-  // e.g. dBSPL = dBFS + 94 - (-26) = dBFS + 120
   if (this->parent_->get_mic_sensitivity().has_value() && this->parent_->get_mic_sensitivity_ref().has_value())
     dB += *this->parent_->get_mic_sensitivity_ref() - *this->parent_->get_mic_sensitivity();
 
@@ -343,13 +337,10 @@ float SoundLevelMeterSensor::adjust_dB(float dB, bool is_rms) {
 /* SoundLevelMeterSensorEq */
 
 void SoundLevelMeterSensorEq::process(std::vector<float> &buffer) {
-  // as adding small floating point numbers with large ones might lead
-  // to precision loss, we first accumulate local sum for entire buffer
-  // and only in the end add it to global sum which could become quite large
-  // for large accumulating periods (like 1 hour), therefore global sum (this->sum_)
-  // is of type double
+  // To reduce precision loss, accumulate a local float sum per buffer and
+  // only merge into the longer-lived double accumulator at the end.
   float local_sum = 0;
-  for (int i = 0; i < buffer.size(); i++) {
+  for (int i = 0; i < static_cast<int>(buffer.size()); i++) {
     local_sum += buffer[i] * buffer[i];
     this->count_++;
     if (this->count_ == this->update_samples_) {
@@ -377,7 +368,7 @@ void SoundLevelMeterSensorMax::set_window_size(uint32_t window_size_ms) {
 }
 
 void SoundLevelMeterSensorMax::process(std::vector<float> &buffer) {
-  for (int i = 0; i < buffer.size(); i++) {
+  for (int i = 0; i < static_cast<int>(buffer.size()); i++) {
     this->sum_ += buffer[i] * buffer[i];
     this->count_sum_++;
     if (this->count_sum_ == this->window_samples_) {
@@ -423,7 +414,7 @@ void SoundLevelMeterSensorMin::set_window_size(uint32_t window_size_ms) {
 }
 
 void SoundLevelMeterSensorMin::process(std::vector<float> &buffer) {
-  for (int i = 0; i < buffer.size(); i++) {
+  for (int i = 0; i < static_cast<int>(buffer.size()); i++) {
     this->sum_ += buffer[i] * buffer[i];
     this->count_sum_++;
     if (this->count_sum_ == this->window_samples_) {
@@ -465,7 +456,7 @@ void SoundLevelMeterSensorMin::reset() {
 /* SoundLevelMeterSensorPeak */
 
 void SoundLevelMeterSensorPeak::process(std::vector<float> &buffer) {
-  for (int i = 0; i < buffer.size(); i++) {
+  for (int i = 0; i < static_cast<int>(buffer.size()); i++) {
     this->peak_ = std::max(this->peak_, abs(buffer[i]));
     this->count_++;
     if (this->count_ == this->update_samples_) {
@@ -498,7 +489,7 @@ void SOS_Filter::process(std::vector<float> &data) {
   int n = data.size();
   int m = this->coeffs_.size();
   for (int j = 0; j < m; j++) {
-#ifdef USE_ESP_DSP  // esp-dsp uses direct form 2
+#ifdef USE_ESP_DSP
 #if defined(USE_ESP32_VARIANT_ESP32)
     dsps_biquad_f32_ae32(&data[0], &data[0], data.size(), &this->coeffs_[j][0], &this->state_[j][0]);
 #elif defined(USE_ESP32_VARIANT_ESP32S3)
@@ -508,13 +499,11 @@ void SOS_Filter::process(std::vector<float> &data) {
 #else
     dsps_biquad_f32_ansi(&data[0], &data[0], data.size(), &this->coeffs_[j][0], &this->state_[j][0]);
 #endif
-#else  // I'm using direct form 2 transposed, which should be a bit more numerically stable
+#else
+    // Direct Form II Transposed; typically a little more numerically stable.
     for (int i = 0; i < n; i++) {
-      // y[i] = b0 * x[i] + s0
       float yi = this->coeffs_[j][0] * data[i] + this->state_[j][0];
-      // s0 = b1 * x[i] - a1 * y[i] + s1
       this->state_[j][0] = this->coeffs_[j][1] * data[i] - this->coeffs_[j][3] * yi + this->state_[j][1];
-      // s1 = b2 * x[i] - a2 * y[i]
       this->state_[j][1] = this->coeffs_[j][2] * data[i] - this->coeffs_[j][4] * yi;
 
       data[i] = yi;
@@ -547,7 +536,6 @@ template<typename T> void BufferStack<T>::push() {
   auto &src = this->buffers_[this->index_ - 1];
   auto n = src.size();
   dst.resize(n);
-  // this is faster than assigning one vector to another, which results in element-wise copying
   memcpy(&dst[0], &src[0], n * sizeof(T));
 }
 
