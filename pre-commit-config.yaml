@@ -1,0 +1,44 @@
+# Local fast checks only. Heavy work (esphome compile, unit tests) runs in CI,
+# not here, so commits stay quick. Install with:
+#   pip install pre-commit && pre-commit install
+# Run across the repo once with:
+#   pre-commit run --all-files
+---
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+        # ESPHome configs use !secret / !lambda custom tags; don't choke on them.
+        args: [--unsafe]
+      - id: check-merge-conflict
+      - id: mixed-line-ending
+        args: [--fix=lf]
+
+  - repo: https://github.com/adrienverge/yamllint
+    rev: v1.35.1
+    hooks:
+      - id: yamllint
+        # Mirror the CI invocation; uses the repo's existing .yamllint config.
+        args: [--strict]
+
+  - repo: https://github.com/pre-commit/mirrors-clang-format
+    rev: v18.1.8
+    hooks:
+      - id: clang-format
+        # Matches the repo's .clang-format; CI runs the same check with --Werror.
+        files: \.(cpp|h)$
+
+  # pylint needs the project's imports available, so run it from the local venv
+  # rather than an isolated pre-commit env. This matches how CI invokes it.
+  - repo: local
+    hooks:
+      - id: pylint
+        name: pylint
+        entry: pylint
+        language: system
+        types: [python]
+        # Uses the repo's existing .pylintrc.
+        require_serial: true

@@ -160,11 +160,28 @@ CONFIG_SENSOR_SCHEMA = cv.typed_schema(
 
 def _validate_effective_sensor_intervals(config):
     top_update = config[CONF_UPDATE_INTERVAL]
+    # C3: a 0ms effective update_interval makes update_samples_ == 0, which stalls
+    # the sensor (it never publishes a real value). positive_time_period_milliseconds
+    # permits 0, so reject it explicitly here. Likewise reject a 0ms window_size.
+    if top_update <= 0:
+        raise cv.Invalid(
+            f"Top-level {CONF_UPDATE_INTERVAL} must be greater than 0ms"
+        )
     for idx, sensor_cfg in enumerate(config[CONF_SENSORS]):
         effective_update = sensor_cfg.get(CONF_UPDATE_INTERVAL, top_update)
+        if effective_update <= 0:
+            raise cv.Invalid(
+                f"Sensor at index {idx} must have an effective "
+                f"{CONF_UPDATE_INTERVAL} greater than 0ms"
+            )
 
         if CONF_WINDOW_SIZE in sensor_cfg:
             window_size = sensor_cfg[CONF_WINDOW_SIZE]
+            if window_size <= 0:
+                raise cv.Invalid(
+                    f"Sensor at index {idx} must have a {CONF_WINDOW_SIZE} "
+                    f"greater than 0ms"
+                )
             if window_size > effective_update:
                 raise cv.Invalid(
                     f"Sensor at index {idx} has {CONF_WINDOW_SIZE} greater than its effective "

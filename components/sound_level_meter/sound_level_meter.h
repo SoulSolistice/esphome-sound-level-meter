@@ -1,6 +1,8 @@
 #pragma once
 
 #include <atomic>
+#include <cinttypes>  // PRIu32 for portable dump_config format specifiers (P4)
+#include <cmath>      // std::fabs / std::log10 / std::sqrt — make math overloads explicit (C1)
 #include <mutex>
 #include <algorithm>
 #include <deque>
