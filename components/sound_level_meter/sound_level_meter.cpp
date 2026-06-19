@@ -54,7 +54,7 @@ uint32_t SoundLevelMeter::ms_to_frames(uint32_t ms) {
 
 void SoundLevelMeter::dump_config() {
   ESP_LOGCONFIG(TAG, "Sound Level Meter:");
-  ESP_LOGCONFIG(TAG, "  Ring Buffer Size: %u ms)", this->ring_buffer_size_ms_);
+  ESP_LOGCONFIG(TAG, "  Ring Buffer Size: %u ms", this->ring_buffer_size_ms_);
   ESP_LOGCONFIG(TAG, "  Warmup Interval: %lu ms", this->warmup_interval_ms_);
   ESP_LOGCONFIG(TAG, "  Task Stack Size: %lu", this->task_stack_size_);
   ESP_LOGCONFIG(TAG, "  Task Priority: %u", this->task_priority_);
@@ -129,29 +129,32 @@ void SoundLevelMeter::loop() {
 }
 
 void SoundLevelMeter::start() {
-  if (!this->is_running_) {
-    xTaskCreatePinnedToCore(SoundLevelMeter::task, "sound_level_meter", this->task_stack_size_, this,
-                            this->task_priority_, &this->task_handle_, this->task_core_);
-    ESP_LOGD(TAG, "Sound Level Meter started");
+  std::lock_guard<std::mutex> lock(this->task_mutex_);
+  if (this->is_running_.load() || this->task_handle_ != nullptr) {
+    return;
   }
+  this->is_pending_stop_.store(false);
+  xTaskCreatePinnedToCore(SoundLevelMeter::task, "sound_level_meter", this->task_stack_size_, this,
+                          this->task_priority_, &this->task_handle_, this->task_core_);
+  ESP_LOGD(TAG, "Sound Level Meter started");
 }
 
 void SoundLevelMeter::stop() {
-  if (this->is_running() && !this->is_pending_stop_) {
-    this->is_pending_stop_ = true;
+  if (this->is_running_.load() && !this->is_pending_stop_.load()) {
+    this->is_pending_stop_.store(true);
     ESP_LOGD(TAG, "Sound Level Meter stopped");
   }
 }
 
-bool SoundLevelMeter::is_running() { return this->is_running_; }
+bool SoundLevelMeter::is_running() { return this->is_running_.load(); }
 
 #ifdef USE_OTA_STATE_LISTENER
 void SoundLevelMeter::on_ota_global_state(ota::OTAState state, float progress, uint8_t error, ota::OTAComponent *comp) {
   if (state == ota::OTA_STARTED) {
-    this->was_running_before_ota_ = this->is_running();
+    this->was_running_before_ota_.store(this->is_running());
     this->stop();
   } else if (state == ota::OTA_ERROR || state == ota::OTA_ABORT) {
-    if (this->was_running_before_ota_) {
+    if (this->was_running_before_ota_.load()) {
       this->start();
     }
   }
@@ -160,7 +163,7 @@ void SoundLevelMeter::on_ota_global_state(ota::OTAState state, float progress, u
 
 void SoundLevelMeter::task(void *param) {
   SoundLevelMeter *this_ = reinterpret_cast<SoundLevelMeter *>(param);
-  this_->is_running_ = true;
+  this_->is_running_.store(true);
   {
     this_->ring_buffer_ = RingBuffer::create(this_->get_audio_stream_info().ms_to_bytes(this_->ring_buffer_size_ms_));
     this_->ring_buffer_weak_ = this_->ring_buffer_;
@@ -184,7 +187,7 @@ void SoundLevelMeter::task(void *param) {
     uint32_t process_time = 0, process_count = 0;
     uint64_t process_start;
 
-    while (!this_->is_pending_stop_) {
+    while (!this_->is_pending_stop_.load()) {
       if (!this_->microphone_source_->is_running()) {
         if (!this_->status_has_warning()) {
           this_->status_set_warning("Microphone isn't running, can't compute statistics");
@@ -231,11 +234,13 @@ void SoundLevelMeter::task(void *param) {
 
   this_->reset();
 
-  this_->is_running_ = false;
-  this_->is_pending_stop_ = false;
-  auto handle = this_->task_handle_;
-  this_->task_handle_ = nullptr;
-  vTaskDelete(handle);
+  this_->is_running_.store(false);
+  this_->is_pending_stop_.store(false);
+  {
+    std::lock_guard<std::mutex> lock(this_->task_mutex_);
+    this_->task_handle_ = nullptr;
+  }
+  vTaskDelete(nullptr);
 }
 
 // Arranging sensors in a sorted order so that those with the same
@@ -376,16 +381,27 @@ void SoundLevelMeterSensorMax::process(std::vector<float> &buffer) {
     this->sum_ += buffer[i] * buffer[i];
     this->count_sum_++;
     if (this->count_sum_ == this->window_samples_) {
-      this->max_ = std::max(this->max_, this->sum_ / this->count_sum_);
+      float window_value = this->sum_ / this->count_sum_;
+      if (!this->has_max_window_) {
+        this->max_ = window_value;
+        this->has_max_window_ = true;
+      } else {
+        this->max_ = std::max(this->max_, window_value);
+      }
       this->sum_ = 0.f;
       this->count_sum_ = 0;
     }
     this->count_max_++;
     if (this->count_max_ == this->update_samples_) {
-      float dB = 10 * log10(this->max_);
-      dB = this->adjust_dB(dB);
-      this->defer_publish_state(dB);
-      this->max_ = std::numeric_limits<float>::min();
+      if (this->has_max_window_) {
+        float dB = 10 * log10(this->max_);
+        dB = this->adjust_dB(dB);
+        this->defer_publish_state(dB);
+      } else {
+        this->defer_publish_state(NAN);
+      }
+      this->max_ = 0.f;
+      this->has_max_window_ = false;
       this->count_max_ = 0;
     }
   }
@@ -393,7 +409,8 @@ void SoundLevelMeterSensorMax::process(std::vector<float> &buffer) {
 
 void SoundLevelMeterSensorMax::reset() {
   this->sum_ = 0.f;
-  this->max_ = std::numeric_limits<float>::min();
+  this->max_ = 0.f;
+  this->has_max_window_ = false;
   this->count_max_ = 0;
   this->count_sum_ = 0;
   this->defer_publish_state(NAN);
@@ -410,16 +427,27 @@ void SoundLevelMeterSensorMin::process(std::vector<float> &buffer) {
     this->sum_ += buffer[i] * buffer[i];
     this->count_sum_++;
     if (this->count_sum_ == this->window_samples_) {
-      this->min_ = std::min(this->min_, this->sum_ / this->count_sum_);
+      float window_value = this->sum_ / this->count_sum_;
+      if (!this->has_min_window_) {
+        this->min_ = window_value;
+        this->has_min_window_ = true;
+      } else {
+        this->min_ = std::min(this->min_, window_value);
+      }
       this->sum_ = 0.f;
       this->count_sum_ = 0;
     }
     this->count_min_++;
     if (this->count_min_ == this->update_samples_) {
-      float dB = 10 * log10(this->min_);
-      dB = this->adjust_dB(dB);
-      this->defer_publish_state(dB);
-      this->min_ = std::numeric_limits<float>::max();
+      if (this->has_min_window_) {
+        float dB = 10 * log10(this->min_);
+        dB = this->adjust_dB(dB);
+        this->defer_publish_state(dB);
+      } else {
+        this->defer_publish_state(NAN);
+      }
+      this->min_ = 0.f;
+      this->has_min_window_ = false;
       this->count_min_ = 0;
     }
   }
@@ -427,7 +455,8 @@ void SoundLevelMeterSensorMin::process(std::vector<float> &buffer) {
 
 void SoundLevelMeterSensorMin::reset() {
   this->sum_ = 0.f;
-  this->min_ = std::numeric_limits<float>::max();
+  this->min_ = 0.f;
+  this->has_min_window_ = false;
   this->count_min_ = 0;
   this->count_sum_ = 0;
   this->defer_publish_state(NAN);

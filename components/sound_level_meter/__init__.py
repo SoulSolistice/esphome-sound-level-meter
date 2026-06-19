@@ -67,16 +67,25 @@ CONF_USE_ESP_DSP = "use_esp_dsp"
 
 ICON_WAVEFORM = "mdi:waveform"
 
-CONFIG_DSP_FILTER_SCHEMA = cv.typed_schema(
-    {
-        CONF_SOS: cv.Schema(
-            {
-                cv.GenerateID(): cv.declare_id(SOS_Filter),
-                cv.Required(CONF_COEFFS): [[cv.float_]],
-            }
-        )
-    }
-)
+
+def _validate_sos_filter(value):
+    value = cv.Schema(
+        {
+            cv.GenerateID(): cv.declare_id(SOS_Filter),
+            cv.Required(CONF_COEFFS): [[cv.float_]],
+        }
+    )(value)
+
+    for idx, row in enumerate(value[CONF_COEFFS]):
+        if len(row) != 5:
+            raise cv.Invalid(
+                f"Each SOS coefficient row must contain exactly 5 values "
+                f"(b0, b1, b2, a1, a2); row {idx} has {len(row)}"
+            )
+    return value
+
+
+CONFIG_DSP_FILTER_SCHEMA = cv.typed_schema({CONF_SOS: _validate_sos_filter})
 
 CONFIG_SENSOR_DSP_FILTER_SCHEMA = cv.ensure_list(
     cv.Any(cv.use_id(Filter), CONFIG_DSP_FILTER_SCHEMA)
@@ -149,6 +158,26 @@ CONFIG_SENSOR_SCHEMA = cv.typed_schema(
     }
 )
 
+
+def _validate_effective_sensor_intervals(config):
+    top_update = config[CONF_UPDATE_INTERVAL]
+    for idx, sensor_cfg in enumerate(config[CONF_SENSORS]):
+        effective_update = sensor_cfg.get(CONF_UPDATE_INTERVAL, top_update)
+        if effective_update <= 0:
+            raise cv.Invalid(
+                f"Sensor at index {idx} must have an effective {CONF_UPDATE_INTERVAL} greater than 0ms"
+            )
+        if (
+            CONF_WINDOW_SIZE in sensor_cfg
+            and sensor_cfg[CONF_WINDOW_SIZE] > effective_update
+        ):
+            raise cv.Invalid(
+                f"Sensor at index {idx} has {CONF_WINDOW_SIZE} greater than its effective "
+                f"{CONF_UPDATE_INTERVAL}"
+            )
+    return config
+
+
 CONFIG_SCHEMA = cv.All(
     cv.Schema(
         {
@@ -182,6 +211,7 @@ CONFIG_SCHEMA = cv.All(
         }
     ).extend(cv.COMPONENT_SCHEMA),
     cv.only_on_esp32,
+    _validate_effective_sensor_intervals,
 )
 
 SOUND_LEVEL_METER_ACTION_SCHEMA = maybe_simple_id(
