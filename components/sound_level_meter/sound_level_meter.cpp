@@ -87,9 +87,12 @@ void SoundLevelMeter::setup() {
       if (bytes_free < data.size()) {
         static uint32_t last_log = 0;
         if (millis() - last_log > 1000) {
-          this->defer([] { ESP_LOGW(TAG, "Not enough free bytes in ring buffer to store incoming audio data."); });
+          this->defer([] {
+            ESP_LOGW(TAG, "Dropping incoming audio chunk because ring buffer is full.");
+          });
           last_log = millis();
         }
+        return;
       }
       ring_buffer->write((void *) data.data(), data.size());
       this->ring_buffer_stats_free_ = std::min(ring_buffer->free(), this->ring_buffer_stats_free_);
@@ -128,14 +131,12 @@ void SoundLevelMeter::start() {
   if (this->is_running_.load() || this->task_handle_ != nullptr) {
     return;
   }
-  // C4: publish "running" under the lock BEFORE the task exists, so a stop()
-  // issued between this call returning and the task being scheduled is not lost.
-  // The task no longer sets is_running_ itself.
+  // Publish "running" under the lock before task creation so a stop request
+  // issued in the brief start window is not lost.
   this->is_pending_stop_.store(false);
   this->is_running_.store(true);
   if (xTaskCreatePinnedToCore(SoundLevelMeter::task, "sound_level_meter", this->task_stack_size_, this,
                               this->task_priority_, &this->task_handle_, this->task_core_) != pdPASS) {
-    // Roll back state if the task could not be created.
     this->is_running_.store(false);
     this->task_handle_ = nullptr;
     ESP_LOGE(TAG, "Failed to create sound_level_meter task");
@@ -145,7 +146,7 @@ void SoundLevelMeter::start() {
 }
 
 void SoundLevelMeter::stop() {
-  // C4: gate on task existence as well as is_running_, so a stop requested in
+  // Gate on task existence as well as is_running_, so a stop requested in
   // the brief start window is honored.
   if ((this->is_running_.load() || this->task_handle_ != nullptr) && !this->is_pending_stop_.load()) {
     this->is_pending_stop_.store(true);
@@ -170,11 +171,11 @@ void SoundLevelMeter::on_ota_global_state(ota::OTAState state, float progress, u
 
 void SoundLevelMeter::task(void *param) {
   SoundLevelMeter *this_ = reinterpret_cast<SoundLevelMeter *>(param);
-  // C4: is_running_ is already true (set in start() under the lock).
   {
     this_->ring_buffer_ = RingBuffer::create(this_->get_audio_stream_info().ms_to_bytes(this_->ring_buffer_size_ms_));
     this_->ring_buffer_weak_ = this_->ring_buffer_;
     BufferStack<float> buffers(this_->ms_to_frames(AUDIO_BUFFER_DURATION_MS));
+    const uint32_t component_update_frames = this_->ms_to_frames(this_->update_interval_ms_);
 
     this_->reset();
 
@@ -219,7 +220,7 @@ void SoundLevelMeter::task(void *param) {
         process_time += esp_timer_get_time() - process_start;
         process_count += buffers.current().size();
 
-        if (process_count >= this_->ms_to_frames(this_->update_interval_ms_)) {
+        if (process_count >= component_update_frames) {
           auto cpu_util = float(process_time) / 1000 / this_->update_interval_ms_;
           auto rb_size = this_->ring_buffer_->available() + this_->ring_buffer_->free();
           auto rb_util = float(rb_size - this_->ring_buffer_stats_free_) / rb_size;
@@ -277,8 +278,7 @@ size_t SoundLevelMeter::read_samples(std::vector<float> &data, TickType_t ticks_
     // `samples_read` elements (4*samples_read bytes), while the raw payload is
     // `bytes_read` bytes; for <=32-bit samples the float buffer is >= the payload,
     // so the descending dst (stride 4) stays ahead of the descending src.
-    // C2: i/j are int; safe for supported buffer sizes (<= ~20 ms @ 48 kHz).
-    // P3: VERIFY the 16-bit path on real hardware/tests before relying on it.
+    // VERIFY the 16-bit path on real hardware/tests before relying on it.
     for (int i = static_cast<int>(bytes_read) - bytes_per_sample, j = static_cast<int>(samples_read) - 1; i >= 0;
          i -= bytes_per_sample, j--) {
       data[j] = audio::unpack_audio_sample_to_q31(&data_as_uint8[i], bytes_per_sample) / float(INT32_MAX);
@@ -481,7 +481,7 @@ void SoundLevelMeterSensorMin::reset() {
 
 void SoundLevelMeterSensorPeak::process(std::vector<float> &buffer) {
   for (int i = 0; i < static_cast<int>(buffer.size()); i++) {
-    // C1: std::fabs forces the floating-point magnitude. Plain abs() can resolve
+    // std::fabs forces the floating-point magnitude. Plain abs() can resolve
     // to int abs(int) and truncate the sample to 0, destroying the peak.
     this->peak_ = std::max(this->peak_, std::fabs(buffer[i]));
     this->count_++;

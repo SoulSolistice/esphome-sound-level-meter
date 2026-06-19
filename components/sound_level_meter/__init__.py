@@ -160,9 +160,8 @@ CONFIG_SENSOR_SCHEMA = cv.typed_schema(
 
 def _validate_effective_sensor_intervals(config):
     top_update = config[CONF_UPDATE_INTERVAL]
-    # C3: a 0ms effective update_interval makes update_samples_ == 0, which stalls
-    # the sensor (it never publishes a real value). positive_time_period_milliseconds
-    # permits 0, so reject it explicitly here. Likewise reject a 0ms window_size.
+    # A 0ms effective update_interval makes update_samples_ == 0, which stalls
+    # the sensor (it never publishes a real value). Likewise reject a 0ms window_size.
     if top_update <= 0:
         raise cv.Invalid(
             f"Top-level {CONF_UPDATE_INTERVAL} must be greater than 0ms"
