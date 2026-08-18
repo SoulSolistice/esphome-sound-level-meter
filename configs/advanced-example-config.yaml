@@ -150,10 +150,15 @@ sound_level_meter:
       dsp_filters: 
         - f_inmp441
 
-    # 'max' sensor type calculates Lmax with specified window_size.
-    # for example, if update_interval is 60s and window_size is 1s
-    # then it will calculate 60 Leq values for each second of audio data
-    # and the result will be max of them
+    # 'max' and 'min' need exactly one detector: either 'window_size' or 'time_weighting'.
+    #
+    # window_size: splits the update_interval into consecutive rectangular windows and
+    # reports the loudest (or quietest) of them. For example, with update_interval 60s and
+    # window_size 1s it computes 60 one-second Leq values and reports the max of them.
+    #
+    # time_weighting: 'fast' (125ms), 'slow' (1s), or an explicit time constant. This is
+    # the exponentially time-weighted level defined by IEC 61672-1, i.e. what LAFmax and
+    # LASmax actually mean in the standard. See "Time weighting" in the README.
     - type: max
       name: LZmax_1s_1min
       id: LZmax_1s_1min
@@ -178,7 +183,8 @@ sound_level_meter:
             #       b0          b1          b2          a1          a2          
             - [ 1.0019784 , -1.9908513, 0.9889158 , -1.9951786, 0.99518436 ]
 
-    # it finds max single sample over whole update_interval
+    # max instantaneous level over the whole update_interval, i.e. the largest absolute
+    # sample rather than an average. For a sine this reads 3.01 dB above the matching Leq.
     - type: peak
       name: LZpeak_1min
       id: LZpeak_1min
@@ -199,6 +205,20 @@ sound_level_meter:
       name: LAmin_1s_1min
       id: LAmin_1s_1min
       window_size: 1s
+      unit_of_measurement: dBA
+      dsp_filters: [f_inmp441, f_a]
+    # IEC 61672-1 exponentially time-weighted levels, for readings comparable with a
+    # real sound level meter
+    - type: max
+      name: LAFmax_1min
+      id: LAFmax_1min
+      time_weighting: fast
+      unit_of_measurement: dBA
+      dsp_filters: [f_inmp441, f_a]
+    - type: min
+      name: LASmin_1min
+      id: LASmin_1min
+      time_weighting: slow
       unit_of_measurement: dBA
       dsp_filters: [f_inmp441, f_a]
     - type: peak

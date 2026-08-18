@@ -147,7 +147,7 @@ class SoundLevelMeter : public Component
   uint32_t warmup_interval_ms_{500};
   uint32_t task_stack_size_{1024};
   uint32_t last_overflow_log_ms_{0};
-  size_t ring_buffer_stats_free_{SIZE_MAX};
+  std::atomic<size_t> ring_buffer_stats_free_{SIZE_MAX};
 
   std::atomic<bool> is_running_{false};
   std::atomic<bool> was_running_before_ota_{false};
@@ -213,9 +213,7 @@ class SoundLevelMeterSensor : public sensor::Sensor {
   uint16_t publish_index_{0};
 
   void defer_publish_state_(float state) { this->parent_->defer_publish_state_(this->publish_index_, state); }
-  float adjust_db_(float db, bool is_rms = true) const {
-    return adjust_dbfs(db, this->parent_->get_db_adjustment(), is_rms);
-  }
+  float adjust_db_(float db) const { return adjust_dbfs(db, this->parent_->get_db_adjustment()); }
 };
 
 /// Equivalent continuous sound level (Leq) over the update interval.
@@ -223,46 +221,55 @@ class SoundLevelMeterSensorEq final : public SoundLevelMeterSensor {
  public:
   void process(const float *data, size_t len) override;
   void reset() override;
-
- protected:
-  double sum_{0.};
-  uint32_t count_{0};
-};
-
-/// Loudest windowed Leq within the update interval.
-class SoundLevelMeterSensorMax final : public SoundLevelMeterSensor {
- public:
-  void set_window_size(uint32_t window_size_ms) { this->window_size_ms_ = window_size_ms; }
-  void process(const float *data, size_t len) override;
-  void reset() override;
   void update_sample_counts(uint32_t sample_rate) override;
 
  protected:
-  double sum_{0.};
-  double max_{0.};
-  uint32_t window_size_ms_{0};
-  uint32_t window_samples_{0};
-  uint32_t count_sum_{0};
-  uint32_t count_max_{0};
-  bool has_max_window_{false};
+  WindowedMeanSquare accumulator_;
 };
 
-/// Quietest windowed Leq within the update interval.
-class SoundLevelMeterSensorMin final : public SoundLevelMeterSensor {
+/// Largest or smallest short-term level observed within the update interval.
+///
+/// Two detector styles are supported, exactly one of which is configured:
+///  - window_size:    the maximum/minimum of consecutive rectangular-window Leq blocks.
+///  - time_weighting: IEC 61672-1 exponential time weighting (Fast / Slow), which is what
+///                    LAFmax / LASmax in the standard actually mean.
+class SoundLevelMeterSensorExtremum : public SoundLevelMeterSensor {
  public:
   void set_window_size(uint32_t window_size_ms) { this->window_size_ms_ = window_size_ms; }
-  void process(const float *data, size_t len) override;
-  void reset() override;
-  void update_sample_counts(uint32_t sample_rate) override;
+  void set_time_constant(uint32_t time_constant_ms) { this->time_constant_ms_ = time_constant_ms; }
+
+  void process(const float *data, size_t len) final;
+  void reset() final;
+  void update_sample_counts(uint32_t sample_rate) final;
 
  protected:
-  double sum_{0.};
-  double min_{0.};
+  explicit SoundLevelMeterSensorExtremum(bool find_max) : find_max_(find_max) {}
+
+  WindowedMeanSquare window_;
+  TimeWeightingDetector detector_;
+  float extreme_{0.f};
   uint32_t window_size_ms_{0};
-  uint32_t window_samples_{0};
-  uint32_t count_sum_{0};
-  uint32_t count_min_{0};
-  bool has_min_window_{false};
+  uint32_t time_constant_ms_{0};
+  uint32_t count_update_{0};
+  bool has_value_{false};
+  const bool find_max_;
+
+  void track_(float mean_square) {
+    if (!this->has_value_ || (this->find_max_ ? mean_square > this->extreme_ : mean_square < this->extreme_)) {
+      this->extreme_ = mean_square;
+      this->has_value_ = true;
+    }
+  }
+};
+
+class SoundLevelMeterSensorMax final : public SoundLevelMeterSensorExtremum {
+ public:
+  SoundLevelMeterSensorMax() : SoundLevelMeterSensorExtremum(true) {}
+};
+
+class SoundLevelMeterSensorMin final : public SoundLevelMeterSensorExtremum {
+ public:
+  SoundLevelMeterSensorMin() : SoundLevelMeterSensorExtremum(false) {}
 };
 
 /// Highest instantaneous absolute amplitude within the update interval.

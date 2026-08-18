@@ -185,7 +185,11 @@ void SoundLevelMeter::setup() {
       return;
     }
     this->ring_buffer_->write(data.data(), data.size());
-    this->ring_buffer_stats_free_ = std::min(this->ring_buffer_->free(), this->ring_buffer_stats_free_);
+    // Diagnostics only: a relaxed read-modify-write may lose a sample against the audio
+    // task's periodic reset, but it is never a data race.
+    const size_t free_now = this->ring_buffer_->free();
+    if (free_now < this->ring_buffer_stats_free_.load(std::memory_order_relaxed))
+      this->ring_buffer_stats_free_.store(free_now, std::memory_order_relaxed);
   });
 
   if (this->is_auto_start_)
@@ -283,7 +287,7 @@ void SoundLevelMeter::start() {
     return;
 
   this->ring_buffer_->reset();
-  this->ring_buffer_stats_free_ = SIZE_MAX;
+  this->ring_buffer_stats_free_.store(SIZE_MAX, std::memory_order_relaxed);
   this->is_pending_stop_.store(false);
   this->is_running_.store(true);
 
@@ -323,13 +327,15 @@ void SoundLevelMeter::task(void *param) {
   const uint32_t sample_rate = this_->get_audio_stream_info_().get_sample_rate();
   const TickType_t read_timeout = 2 * pdMS_TO_TICKS(AUDIO_BUFFER_DURATION_MS);
 
-  this_->reset_();
-  this_->microphone_source_->start();
-
 #ifdef USE_SENSOR
+  // Before reset_(): resetting primes the time-weighting detectors, which needs the
+  // frame counts derived from the sample rate.
   for (auto *s : this_->sensors_)
     s->update_sample_counts(sample_rate);
 #endif
+
+  this_->reset_();
+  this_->microphone_source_->start();
 
   if (this_->is_high_freq_)
     this_->high_freq_.start();
@@ -375,12 +381,13 @@ void SoundLevelMeter::task(void *param) {
     if (stats_frames > 0 && process_count >= stats_frames) {
       const float cpu_util = static_cast<float>(process_time) / 1000.f / this_->update_interval_ms_;
       const size_t rb_size = this_->ring_buffer_->available() + this_->ring_buffer_->free();
-      const float rb_util = static_cast<float>(rb_size - this_->ring_buffer_stats_free_) / rb_size;
+      const size_t rb_min_free = this_->ring_buffer_stats_free_.load(std::memory_order_relaxed);
+      const float rb_util = static_cast<float>(rb_size - rb_min_free) / rb_size;
       ESP_LOGD(TAG, "CPU (core %d) utilization: %.1f%%, ring buffer utilization: %.1f%%",
                static_cast<int>(xPortGetCoreID()), cpu_util * 100.f, rb_util * 100.f);
       process_time = 0;
       process_count = 0;
-      this_->ring_buffer_stats_free_ = SIZE_MAX;
+      this_->ring_buffer_stats_free_.store(SIZE_MAX, std::memory_order_relaxed);
     }
 #endif
   }
@@ -503,99 +510,64 @@ void SoundLevelMeterSensor::update_sample_counts(uint32_t sample_rate) {
 
 /* SoundLevelMeterSensorEq */
 
+void SoundLevelMeterSensorEq::update_sample_counts(uint32_t sample_rate) {
+  SoundLevelMeterSensor::update_sample_counts(sample_rate);
+  this->accumulator_.configure(sample_rate, this->update_interval_ms_);
+}
+
 void SoundLevelMeterSensorEq::process(const float *data, size_t len) {
-  double local_sum = 0.;
+  float mean_square;
   for (size_t i = 0; i < len; i++) {
-    local_sum += static_cast<double>(data[i]) * data[i];
-    this->count_++;
-    if (this->count_ == this->update_samples_) {
-      const double mean_square = (this->sum_ + local_sum) / this->count_;
+    if (this->accumulator_.process(data[i], mean_square))
       this->defer_publish_state_(this->adjust_db_(mean_square_to_dbfs(mean_square)));
-      this->sum_ = 0.;
-      this->count_ = 0;
-      local_sum = 0.;
-    }
   }
-  this->sum_ += local_sum;
 }
 
 void SoundLevelMeterSensorEq::reset() {
-  this->sum_ = 0.;
-  this->count_ = 0;
+  this->accumulator_.restart();
   this->defer_publish_state_(NAN);
 }
 
-/* SoundLevelMeterSensorMax */
+/* SoundLevelMeterSensorExtremum */
 
-void SoundLevelMeterSensorMax::update_sample_counts(uint32_t sample_rate) {
+void SoundLevelMeterSensorExtremum::update_sample_counts(uint32_t sample_rate) {
   SoundLevelMeterSensor::update_sample_counts(sample_rate);
-  this->window_samples_ = ms_to_frames(sample_rate, this->window_size_ms_);
+  this->window_.configure(sample_rate, this->window_size_ms_);
+  this->detector_.configure(sample_rate, this->time_constant_ms_);
 }
 
-void SoundLevelMeterSensorMax::process(const float *data, size_t len) {
+void SoundLevelMeterSensorExtremum::process(const float *data, size_t len) {
+  const bool exponential = this->detector_.enabled();
+  float mean_square;
+
   for (size_t i = 0; i < len; i++) {
-    this->sum_ += static_cast<double>(data[i]) * data[i];
-    this->count_sum_++;
-    if (this->count_sum_ == this->window_samples_) {
-      const double window_value = this->sum_ / this->count_sum_;
-      this->max_ = this->has_max_window_ ? std::max(this->max_, window_value) : window_value;
-      this->has_max_window_ = true;
-      this->sum_ = 0.;
-      this->count_sum_ = 0;
+    if (exponential) {
+      if (this->detector_.process(data[i], mean_square))
+        this->track_(mean_square);
+    } else if (this->window_.process(data[i], mean_square)) {
+      this->track_(mean_square);
     }
-    this->count_max_++;
-    if (this->count_max_ == this->update_samples_) {
-      this->defer_publish_state_(this->has_max_window_ ? this->adjust_db_(mean_square_to_dbfs(this->max_)) : NAN);
-      this->max_ = 0.;
-      this->has_max_window_ = false;
-      this->count_max_ = 0;
-    }
+
+    if (++this->count_update_ < this->update_samples_)
+      continue;
+
+    this->defer_publish_state_(this->has_value_ ? this->adjust_db_(mean_square_to_dbfs(this->extreme_)) : NAN);
+    this->count_update_ = 0;
+    this->extreme_ = 0.f;
+    this->has_value_ = false;
+    // Drop any part-finished window so that its energy cannot leak into the next interval.
+    // Without this, a window_size that does not divide update_interval carries the tail of
+    // one interval into the first window of the next.
+    this->window_.restart();
   }
 }
 
-void SoundLevelMeterSensorMax::reset() {
-  this->sum_ = 0.;
-  this->max_ = 0.;
-  this->has_max_window_ = false;
-  this->count_max_ = 0;
-  this->count_sum_ = 0;
-  this->defer_publish_state_(NAN);
-}
-
-/* SoundLevelMeterSensorMin */
-
-void SoundLevelMeterSensorMin::update_sample_counts(uint32_t sample_rate) {
-  SoundLevelMeterSensor::update_sample_counts(sample_rate);
-  this->window_samples_ = ms_to_frames(sample_rate, this->window_size_ms_);
-}
-
-void SoundLevelMeterSensorMin::process(const float *data, size_t len) {
-  for (size_t i = 0; i < len; i++) {
-    this->sum_ += static_cast<double>(data[i]) * data[i];
-    this->count_sum_++;
-    if (this->count_sum_ == this->window_samples_) {
-      const double window_value = this->sum_ / this->count_sum_;
-      this->min_ = this->has_min_window_ ? std::min(this->min_, window_value) : window_value;
-      this->has_min_window_ = true;
-      this->sum_ = 0.;
-      this->count_sum_ = 0;
-    }
-    this->count_min_++;
-    if (this->count_min_ == this->update_samples_) {
-      this->defer_publish_state_(this->has_min_window_ ? this->adjust_db_(mean_square_to_dbfs(this->min_)) : NAN);
-      this->min_ = 0.;
-      this->has_min_window_ = false;
-      this->count_min_ = 0;
-    }
-  }
-}
-
-void SoundLevelMeterSensorMin::reset() {
-  this->sum_ = 0.;
-  this->min_ = 0.;
-  this->has_min_window_ = false;
-  this->count_min_ = 0;
-  this->count_sum_ = 0;
+void SoundLevelMeterSensorExtremum::reset() {
+  this->window_.restart();
+  this->detector_.restart();
+  this->extreme_ = 0.f;
+  this->has_value_ = false;
+  this->count_update_ = 0;
   this->defer_publish_state_(NAN);
 }
 
@@ -606,7 +578,7 @@ void SoundLevelMeterSensorPeak::process(const float *data, size_t len) {
     this->peak_ = std::max(this->peak_, std::fabs(data[i]));
     this->count_++;
     if (this->count_ == this->update_samples_) {
-      this->defer_publish_state_(this->adjust_db_(peak_to_dbfs(this->peak_), false));
+      this->defer_publish_state_(this->adjust_db_(peak_to_dbfs(this->peak_)));
       this->peak_ = 0.f;
       this->count_ = 0;
     }

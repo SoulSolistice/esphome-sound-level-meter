@@ -18,7 +18,7 @@ from esphome.const import (
     STATE_CLASS_MEASUREMENT,
     UNIT_DECIBEL,
 )
-from esphome.core import ID
+from esphome.core import ID, TimePeriodMilliseconds
 
 CODEOWNERS = ["@stas-sl"]
 DEPENDENCIES = ["esp32", "microphone"]
@@ -62,6 +62,7 @@ CONF_SOS = "sos"
 CONF_TASK_CORE = "task_core"
 CONF_TASK_PRIORITY = "task_priority"
 CONF_TASK_STACK_SIZE = "task_stack_size"
+CONF_TIME_WEIGHTING = "time_weighting"
 CONF_USE_ESP_DSP = "use_esp_dsp"
 CONF_WARMUP_INTERVAL = "warmup_interval"
 
@@ -69,6 +70,16 @@ ICON_WAVEFORM = "mdi:waveform"
 
 # Number of coefficients per second-order section: b0, b1, b2, a1, a2.
 SOS_COEFFS_PER_SECTION = 5
+
+# IEC 61672-1 exponential time weightings, as time constants.
+TIME_WEIGHTINGS = {"fast": 125, "slow": 1000}
+
+
+def _validate_time_weighting(value):
+    """Accept the IEC names, or an explicit time constant for anything else."""
+    if isinstance(value, str) and value.lower() in TIME_WEIGHTINGS:
+        return TimePeriodMilliseconds(milliseconds=TIME_WEIGHTINGS[value.lower()])
+    return cv.positive_time_period_milliseconds(value)
 
 
 def AUTO_LOAD(config) -> list[str]:
@@ -135,15 +146,17 @@ def _sensor_schema(class_, extra=None):
     ).extend(schema)
 
 
-_WINDOW_SIZE_SCHEMA = {
-    cv.Required(CONF_WINDOW_SIZE): cv.positive_time_period_milliseconds
+# Exactly one of these is required; _validate_detector() enforces that.
+_EXTREMUM_SCHEMA = {
+    cv.Optional(CONF_WINDOW_SIZE): cv.positive_time_period_milliseconds,
+    cv.Optional(CONF_TIME_WEIGHTING): _validate_time_weighting,
 }
 
 CONFIG_SENSOR_SCHEMA = cv.typed_schema(
     {
         CONF_EQ: _sensor_schema(SoundLevelMeterSensorEq),
-        CONF_MAX: _sensor_schema(SoundLevelMeterSensorMax, _WINDOW_SIZE_SCHEMA),
-        CONF_MIN: _sensor_schema(SoundLevelMeterSensorMin, _WINDOW_SIZE_SCHEMA),
+        CONF_MAX: _sensor_schema(SoundLevelMeterSensorMax, _EXTREMUM_SCHEMA),
+        CONF_MIN: _sensor_schema(SoundLevelMeterSensorMin, _EXTREMUM_SCHEMA),
         CONF_PEAK: _sensor_schema(SoundLevelMeterSensorPeak),
     }
 )
@@ -185,6 +198,69 @@ def _validate_effective_sensor_intervals(config):
                     f"effective {CONF_UPDATE_INTERVAL}",
                     [CONF_SENSORS, idx, CONF_WINDOW_SIZE],
                 )
+
+        if (time_weighting := sensor_cfg.get(CONF_TIME_WEIGHTING)) is not None:
+            if time_weighting.total_milliseconds <= 0:
+                raise cv.Invalid(
+                    f"Sensor at index {idx} must have a {CONF_TIME_WEIGHTING} "
+                    f"greater than 0ms",
+                    [CONF_SENSORS, idx, CONF_TIME_WEIGHTING],
+                )
+    return config
+
+
+def _validate_detectors(config):
+    """'max' and 'min' need exactly one detector: a rectangular window or a time weighting."""
+    for idx, sensor_cfg in enumerate(config[CONF_SENSORS]):
+        if sensor_cfg[CONF_TYPE] not in (CONF_MAX, CONF_MIN):
+            continue
+        has_window = CONF_WINDOW_SIZE in sensor_cfg
+        has_weighting = CONF_TIME_WEIGHTING in sensor_cfg
+        if has_window == has_weighting:
+            chosen = "both" if has_window else "neither"
+            raise cv.Invalid(
+                f"'{sensor_cfg[CONF_TYPE]}' sensor at index {idx} needs exactly one of "
+                f"{CONF_WINDOW_SIZE} or {CONF_TIME_WEIGHTING} ({chosen} given). "
+                f"{CONF_TIME_WEIGHTING} (fast/slow) gives the IEC 61672-1 exponentially "
+                f"time-weighted level; {CONF_WINDOW_SIZE} gives the maximum of "
+                f"consecutive rectangular-window Leq blocks",
+                [CONF_SENSORS, idx],
+            )
+    return config
+
+
+def _validate_filter_sharing(config):
+    """Reject a filter instance that would see two different input signals.
+
+    Sensors are evaluated with a shared prefix stack, so a filter is run once per block for
+    each distinct chain prefix it appears behind. Because a filter owns one delay line,
+    appearing behind two different prefixes makes it process two unrelated signals through
+    the same state, silently corrupting both. Give each context its own filter instead.
+    """
+
+    def describe(prefix):
+        return " -> ".join(prefix) if prefix else "(none)"
+
+    prefixes = {}
+    for idx, sensor_cfg in enumerate(config[CONF_SENSORS]):
+        chain = [
+            str(entry) if isinstance(entry, core.ID) else f"<inline #{id(entry):x}>"
+            for entry in sensor_cfg[CONF_DSP_FILTERS]
+        ]
+        for position, name in enumerate(chain):
+            if name.startswith("<inline "):
+                continue  # an inline filter belongs to exactly one sensor
+            prefix = tuple(chain[:position])
+            previous = prefixes.setdefault(name, prefix)
+            if previous != prefix:
+                raise cv.Invalid(
+                    f"dsp_filter '{name}' is used behind two different filter chains: "
+                    f"{describe(previous)} and {describe(prefix)}. A filter holds one "
+                    f"delay line, so "
+                    f"it cannot be shared between chains that feed it different signals. "
+                    f"Define a second filter with the same coefficients for one of them",
+                    [CONF_SENSORS, idx, CONF_DSP_FILTERS, position],
+                )
     return config
 
 
@@ -222,6 +298,8 @@ CONFIG_SCHEMA = cv.All(
     ).extend(cv.COMPONENT_SCHEMA),
     cv.only_on_esp32,
     _validate_effective_sensor_intervals,
+    _validate_detectors,
+    _validate_filter_sharing,
 )
 
 SOUND_LEVEL_METER_ACTION_SCHEMA = maybe_simple_id(
@@ -251,6 +329,8 @@ async def add_sensor(config, parent):
     cg.add(s.set_parent(parent))
     if (window_size := config.get(CONF_WINDOW_SIZE)) is not None:
         cg.add(s.set_window_size(window_size))
+    if (time_weighting := config.get(CONF_TIME_WEIGHTING)) is not None:
+        cg.add(s.set_time_constant(time_weighting))
     if (update_interval := config.get(CONF_UPDATE_INTERVAL)) is not None:
         cg.add(s.set_update_interval(update_interval))
 

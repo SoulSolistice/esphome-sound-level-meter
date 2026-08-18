@@ -157,10 +157,16 @@ sound_level_meter:
       dsp_filters: 
         - f_inmp441
 
-    # 'max' sensor type calculates Lmax with specified window_size.
-    # for example, if update_interval is 60s and window_size is 1s
-    # then it will calculate 60 Leq values for each second of audio data
-    # and the result will be max of them
+    # 'max' and 'min' need exactly one detector: either 'window_size' or 'time_weighting'.
+    #
+    # window_size: splits the update_interval into consecutive rectangular windows and
+    # reports the loudest (or quietest) of them. For example, with update_interval 60s and
+    # window_size 1s it computes 60 one-second Leq values and reports the max of them.
+    #
+    # time_weighting: 'fast' (125ms), 'slow' (1s), or an explicit time constant. This is
+    # the exponentially time-weighted level defined by IEC 61672-1, i.e. what LAFmax and
+    # LASmax actually mean in the standard. Prefer it if you need comparable readings; see
+    # "Time weighting" below for how the two differ.
     - type: max
       name: LZmax_1s_1min
       id: LZmax_1s_1min
@@ -185,7 +191,8 @@ sound_level_meter:
             #       b0          b1          b2          a1          a2          
             - [ 1.0019784 , -1.9908513, 0.9889158 , -1.9951786, 0.99518436 ]
 
-    # it finds max single sample over whole update_interval
+    # max instantaneous level over the whole update_interval, i.e. the largest absolute
+    # sample rather than an average. For a sine this reads 3.01 dB above the matching Leq.
     - type: peak
       name: LZpeak_1min
       id: LZpeak_1min
@@ -206,6 +213,20 @@ sound_level_meter:
       name: LAmin_1s_1min
       id: LAmin_1s_1min
       window_size: 1s
+      unit_of_measurement: dBA
+      dsp_filters: [f_inmp441, f_a]
+    # IEC 61672-1 exponentially time-weighted levels, for readings comparable with a
+    # real sound level meter
+    - type: max
+      name: LAFmax_1min
+      id: LAFmax_1min
+      time_weighting: fast
+      unit_of_measurement: dBA
+      dsp_filters: [f_inmp441, f_a]
+    - type: min
+      name: LASmin_1min
+      id: LASmin_1min
+      time_weighting: slow
       unit_of_measurement: dBA
       dsp_filters: [f_inmp441, f_a]
     - type: peak
@@ -253,6 +274,50 @@ switch:
     turn_off_action:
       - sound_level_meter.stop
 ```
+
+## Time weighting
+
+`max` and `min` sensors offer two detectors, and they do not measure the same thing.
+
+| | `window_size: 1s` | `time_weighting: slow` | `time_weighting: fast` |
+|---|---|---|---|
+| detector | rectangular, non-overlapping | exponential, τ = 1s | exponential, τ = 125ms |
+| IEC 61672-1 | no | yes (LAS) | yes (LAF) |
+
+Measured against a true exponential detector on broadband bursts over a quiet background:
+
+| event | `window_size: 1s` vs LASmax | `window_size: 1s` vs LAFmax |
+|---|---|---|
+| 20 ms burst | +0.04 dB | −8.7 dB |
+| 125 ms burst | +0.15 dB | −7.9 dB |
+| 500 ms burst | +0.70 dB | −5.5 dB |
+| 2 s burst | +1.7 dB | −1.5 dB |
+
+So `window_size: 1s` tracks **Slow** closely but is a poor stand-in for **Fast**. Rectangular
+windows also do not overlap, so a transient landing near a window boundary is split across
+two windows: the same 300 ms burst slid across a 1 s boundary varies by up to **2.9 dB**,
+where an exponential detector varies by 0.3 dB. Use `time_weighting` if you need readings
+that are comparable with a real sound level meter, and `window_size` if you specifically
+want short-Leq statistics.
+
+The exponential detector withholds its output for the first 5 τ after start so that it
+cannot report a spurious minimum while settling — 0.6 s for Fast, 5 s for Slow. If your
+update_interval is shorter than that, the first interval after start publishes `NaN`.
+
+## Measurement caveats
+
+- **Z-weighted readings are not band-limited.** IEC 61672-1 Z-weighting is flat from 10 Hz
+  to 20 kHz with a defined roll-off outside; the unweighted path here integrates everything
+  down to DC. The microphone equalisation filters have a large low-frequency boost
+  (+17 dB at DC for `f_inmp441`), so any residual DC offset or subsonic noise is amplified
+  into `LZ*` readings. This is the main reason dBZ sits well above dBA. A/C-weighted
+  readings are unaffected, since both weightings reject that region strongly. Add a
+  high-pass section to the chain if you need meaningful Z levels.
+- **Peak is a sampled peak.** At 48 kHz the largest sample under-reads the true continuous
+  peak by up to 0.02 dB at 1 kHz and 0.3 dB at 20 kHz, since the actual peak can fall
+  between samples.
+- **There is no overload indicator.** If the microphone clips, readings stay plausible but
+  are wrong. Keep an eye on `peak` staying below 0 dBFS.
 
 ## 10 bands spectrum analyzer
 
