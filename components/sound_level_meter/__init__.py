@@ -9,6 +9,7 @@ from esphome.components.esp32 import add_idf_component
 from esphome.const import (
     CONF_ID,
     CONF_MICROPHONE,
+    CONF_OFFSET,
     CONF_SENSORS,
     CONF_TYPE,
     CONF_UPDATE_INTERVAL,
@@ -17,10 +18,10 @@ from esphome.const import (
     STATE_CLASS_MEASUREMENT,
     UNIT_DECIBEL,
 )
+from esphome.core import ID
 
 CODEOWNERS = ["@stas-sl"]
 DEPENDENCIES = ["esp32", "microphone"]
-AUTO_LOAD = ["sensor", "audio"]
 MULTI_CONF = True
 
 sound_level_meter_ns = cg.esphome_ns.namespace("sound_level_meter")
@@ -41,45 +42,71 @@ SoundLevelMeterSensorPeak = sound_level_meter_ns.class_(
     "SoundLevelMeterSensorPeak", SoundLevelMeterSensor, sensor.Sensor
 )
 Filter = sound_level_meter_ns.class_("Filter")
-SOS_Filter = sound_level_meter_ns.class_("SOS_Filter", Filter)
+SosFilter = sound_level_meter_ns.class_("SosFilter", Filter)
+SosCoeffs = sound_level_meter_ns.struct("SosCoeffs")
 StartAction = sound_level_meter_ns.class_("StartAction", automation.Action)
 StopAction = sound_level_meter_ns.class_("StopAction", automation.Action)
 
+CONF_AUTO_START = "auto_start"
+CONF_COEFFS = "coeffs"
+CONF_DSP_FILTERS = "dsp_filters"
 CONF_EQ = "eq"
+CONF_HIGH_FREQ = "high_freq"
 CONF_MAX = "max"
+CONF_MIC_SENSITIVITY = "mic_sensitivity"
+CONF_MIC_SENSITIVITY_REF = "mic_sensitivity_ref"
 CONF_MIN = "min"
 CONF_PEAK = "peak"
 CONF_RING_BUFFER_SIZE = "ring_buffer_size"
 CONF_SOS = "sos"
-CONF_COEFFS = "coeffs"
-CONF_WARMUP_INTERVAL = "warmup_interval"
-CONF_TASK_STACK_SIZE = "task_stack_size"
-CONF_TASK_PRIORITY = "task_priority"
 CONF_TASK_CORE = "task_core"
-CONF_MIC_SENSITIVITY = "mic_sensitivity"
-CONF_MIC_SENSITIVITY_REF = "mic_sensitivity_ref"
-CONF_OFFSET = "offset"
-CONF_HIGH_FREQ = "high_freq"
-CONF_DSP_FILTERS = "dsp_filters"
-CONF_AUTO_START = "auto_start"
+CONF_TASK_PRIORITY = "task_priority"
+CONF_TASK_STACK_SIZE = "task_stack_size"
 CONF_USE_ESP_DSP = "use_esp_dsp"
+CONF_WARMUP_INTERVAL = "warmup_interval"
 
 ICON_WAVEFORM = "mdi:waveform"
+
+# Number of coefficients per second-order section: b0, b1, b2, a1, a2.
+SOS_COEFFS_PER_SECTION = 5
+
+
+def AUTO_LOAD(config) -> list[str]:
+    """Only pull in the sensor platform when the user actually configured sensors.
+
+    A meter without sensors compiles without the sensor component at all; the C++ side is
+    gated behind ``#ifdef USE_SENSOR`` to match.
+    """
+    loads = ["audio"]
+    configs = config if isinstance(config, list) else [config]
+    for conf in configs:
+        if isinstance(conf, dict) and conf.get(CONF_SENSORS):
+            loads.append("sensor")
+            break
+    return loads
 
 
 def _validate_sos_filter(value):
     value = cv.Schema(
         {
-            cv.GenerateID(): cv.declare_id(SOS_Filter),
+            cv.GenerateID(): cv.declare_id(SosFilter),
             cv.Required(CONF_COEFFS): [[cv.float_]],
         }
     )(value)
 
+    # An empty table would emit `static const SosCoeffs x[] = {};`, which is not valid C++.
+    if not value[CONF_COEFFS]:
+        raise cv.Invalid(
+            f"{CONF_SOS} filter needs at least one section", [CONF_COEFFS]
+        )
+
     for idx, row in enumerate(value[CONF_COEFFS]):
-        if len(row) != 5:
+        if len(row) != SOS_COEFFS_PER_SECTION:
             raise cv.Invalid(
-                f"Each SOS coefficient row must contain exactly 5 values "
-                f"(b0, b1, b2, a1, a2); row {idx} has {len(row)}"
+                f"Each SOS coefficient row must contain exactly "
+                f"{SOS_COEFFS_PER_SECTION} values (b0, b1, b2, a1, a2); "
+                f"row {idx} has {len(row)}",
+                [CONF_COEFFS, idx],
             )
     return value
 
@@ -90,101 +117,73 @@ CONFIG_SENSOR_DSP_FILTER_SCHEMA = cv.ensure_list(
     cv.Any(cv.use_id(Filter), CONFIG_DSP_FILTER_SCHEMA)
 )
 
+
+def _sensor_schema(class_, extra=None):
+    schema = {
+        cv.Optional(CONF_UPDATE_INTERVAL): cv.positive_time_period_milliseconds,
+        cv.Optional(CONF_DSP_FILTERS, default=[]): CONFIG_SENSOR_DSP_FILTER_SCHEMA,
+    }
+    if extra:
+        schema.update(extra)
+    return sensor.sensor_schema(
+        class_,
+        unit_of_measurement=UNIT_DECIBEL,
+        accuracy_decimals=2,
+        state_class=STATE_CLASS_MEASUREMENT,
+        device_class=DEVICE_CLASS_SOUND_PRESSURE,
+        icon=ICON_WAVEFORM,
+    ).extend(schema)
+
+
+_WINDOW_SIZE_SCHEMA = {
+    cv.Required(CONF_WINDOW_SIZE): cv.positive_time_period_milliseconds
+}
+
 CONFIG_SENSOR_SCHEMA = cv.typed_schema(
     {
-        CONF_EQ: sensor.sensor_schema(
-            SoundLevelMeterSensorEq,
-            unit_of_measurement=UNIT_DECIBEL,
-            accuracy_decimals=2,
-            state_class=STATE_CLASS_MEASUREMENT,
-            device_class=DEVICE_CLASS_SOUND_PRESSURE,
-            icon=ICON_WAVEFORM,
-        ).extend(
-            {
-                cv.Optional(CONF_UPDATE_INTERVAL): cv.positive_time_period_milliseconds,
-                cv.Optional(
-                    CONF_DSP_FILTERS, default=[]
-                ): CONFIG_SENSOR_DSP_FILTER_SCHEMA,
-            }
-        ),
-        CONF_MAX: sensor.sensor_schema(
-            SoundLevelMeterSensorMax,
-            unit_of_measurement=UNIT_DECIBEL,
-            accuracy_decimals=2,
-            state_class=STATE_CLASS_MEASUREMENT,
-            device_class=DEVICE_CLASS_SOUND_PRESSURE,
-            icon=ICON_WAVEFORM,
-        ).extend(
-            {
-                cv.Optional(CONF_UPDATE_INTERVAL): cv.positive_time_period_milliseconds,
-                cv.Required(CONF_WINDOW_SIZE): cv.positive_time_period_milliseconds,
-                cv.Optional(
-                    CONF_DSP_FILTERS, default=[]
-                ): CONFIG_SENSOR_DSP_FILTER_SCHEMA,
-            }
-        ),
-        CONF_MIN: sensor.sensor_schema(
-            SoundLevelMeterSensorMin,
-            unit_of_measurement=UNIT_DECIBEL,
-            accuracy_decimals=2,
-            state_class=STATE_CLASS_MEASUREMENT,
-            device_class=DEVICE_CLASS_SOUND_PRESSURE,
-            icon=ICON_WAVEFORM,
-        ).extend(
-            {
-                cv.Optional(CONF_UPDATE_INTERVAL): cv.positive_time_period_milliseconds,
-                cv.Required(CONF_WINDOW_SIZE): cv.positive_time_period_milliseconds,
-                cv.Optional(
-                    CONF_DSP_FILTERS, default=[]
-                ): CONFIG_SENSOR_DSP_FILTER_SCHEMA,
-            }
-        ),
-        CONF_PEAK: sensor.sensor_schema(
-            SoundLevelMeterSensorPeak,
-            unit_of_measurement=UNIT_DECIBEL,
-            accuracy_decimals=2,
-            state_class=STATE_CLASS_MEASUREMENT,
-            device_class=DEVICE_CLASS_SOUND_PRESSURE,
-            icon=ICON_WAVEFORM,
-        ).extend(
-            {
-                cv.Optional(CONF_UPDATE_INTERVAL): cv.positive_time_period_milliseconds,
-                cv.Optional(
-                    CONF_DSP_FILTERS, default=[]
-                ): CONFIG_SENSOR_DSP_FILTER_SCHEMA,
-            }
-        ),
+        CONF_EQ: _sensor_schema(SoundLevelMeterSensorEq),
+        CONF_MAX: _sensor_schema(SoundLevelMeterSensorMax, _WINDOW_SIZE_SCHEMA),
+        CONF_MIN: _sensor_schema(SoundLevelMeterSensorMin, _WINDOW_SIZE_SCHEMA),
+        CONF_PEAK: _sensor_schema(SoundLevelMeterSensorPeak),
     }
 )
 
 
 def _validate_effective_sensor_intervals(config):
-    top_update = config[CONF_UPDATE_INTERVAL]
+    # TimePeriod does not compare against plain ints, so work in milliseconds throughout.
+    top_update = config[CONF_UPDATE_INTERVAL].total_milliseconds
     # A 0ms effective update_interval makes update_samples_ == 0, which stalls
     # the sensor (it never publishes a real value). Likewise reject a 0ms window_size.
     if top_update <= 0:
         raise cv.Invalid(
-            f"Top-level {CONF_UPDATE_INTERVAL} must be greater than 0ms"
+            f"Top-level {CONF_UPDATE_INTERVAL} must be greater than 0ms",
+            [CONF_UPDATE_INTERVAL],
         )
     for idx, sensor_cfg in enumerate(config[CONF_SENSORS]):
-        effective_update = sensor_cfg.get(CONF_UPDATE_INTERVAL, top_update)
+        if (update_interval := sensor_cfg.get(CONF_UPDATE_INTERVAL)) is not None:
+            effective_update = update_interval.total_milliseconds
+        else:
+            effective_update = top_update
         if effective_update <= 0:
             raise cv.Invalid(
                 f"Sensor at index {idx} must have an effective "
-                f"{CONF_UPDATE_INTERVAL} greater than 0ms"
+                f"{CONF_UPDATE_INTERVAL} greater than 0ms",
+                [CONF_SENSORS, idx, CONF_UPDATE_INTERVAL],
             )
 
-        if CONF_WINDOW_SIZE in sensor_cfg:
-            window_size = sensor_cfg[CONF_WINDOW_SIZE]
-            if window_size <= 0:
+        if (window_size := sensor_cfg.get(CONF_WINDOW_SIZE)) is not None:
+            window_size_ms = window_size.total_milliseconds
+            if window_size_ms <= 0:
                 raise cv.Invalid(
                     f"Sensor at index {idx} must have a {CONF_WINDOW_SIZE} "
-                    f"greater than 0ms"
+                    f"greater than 0ms",
+                    [CONF_SENSORS, idx, CONF_WINDOW_SIZE],
                 )
-            if window_size > effective_update:
+            if window_size_ms > effective_update:
                 raise cv.Invalid(
-                    f"Sensor at index {idx} has {CONF_WINDOW_SIZE} greater than its effective "
-                    f"{CONF_UPDATE_INTERVAL}"
+                    f"Sensor at index {idx} has {CONF_WINDOW_SIZE} greater than its "
+                    f"effective {CONF_UPDATE_INTERVAL}",
+                    [CONF_SENSORS, idx, CONF_WINDOW_SIZE],
                 )
     return config
 
@@ -231,10 +230,18 @@ SOUND_LEVEL_METER_ACTION_SCHEMA = maybe_simple_id(
 
 
 async def add_dsp_filter(config, parent):
-    f = None
-    if config[CONF_TYPE] == CONF_SOS:
-        f = cg.new_Pvariable(config[CONF_ID], config[CONF_COEFFS])
-    assert f is not None
+    if config[CONF_TYPE] != CONF_SOS:
+        raise ValueError(f"Unknown dsp filter type: {config[CONF_TYPE]}")
+
+    rows = config[CONF_COEFFS]
+    # One `static const SosCoeffs[]` in flash instead of one setter call per section.
+    table = cg.static_const_array(
+        ID(f"{config[CONF_ID]}_coeffs", is_declaration=True, type=SosCoeffs),
+        cg.ArrayInitializer(
+            *(cg.ArrayInitializer(*row) for row in rows), multiline=True
+        ),
+    )
+    f = cg.new_Pvariable(config[CONF_ID], table, len(rows))
     cg.add(parent.add_dsp_filter(f))
     return f
 
@@ -242,17 +249,20 @@ async def add_dsp_filter(config, parent):
 async def add_sensor(config, parent):
     s = await sensor.new_sensor(config)
     cg.add(s.set_parent(parent))
-    if CONF_WINDOW_SIZE in config:
-        cg.add(s.set_window_size(config[CONF_WINDOW_SIZE]))
-    if CONF_UPDATE_INTERVAL in config:
-        cg.add(s.set_update_interval(config[CONF_UPDATE_INTERVAL]))
-    for fc in config[CONF_DSP_FILTERS]:
-        f = None
+    if (window_size := config.get(CONF_WINDOW_SIZE)) is not None:
+        cg.add(s.set_window_size(window_size))
+    if (update_interval := config.get(CONF_UPDATE_INTERVAL)) is not None:
+        cg.add(s.set_update_interval(update_interval))
+
+    filter_configs = config[CONF_DSP_FILTERS]
+    cg.add(s.init_dsp_filters(len(filter_configs)))
+    for fc in filter_configs:
         if isinstance(fc, core.ID):
             f = await cg.get_variable(fc)
         elif isinstance(fc, dict):
             f = await add_dsp_filter(fc, parent)
-        assert f is not None
+        else:
+            raise ValueError(f"Unexpected dsp filter entry: {fc!r}")
         cg.add(s.add_dsp_filter(f))
     cg.add(parent.add_sensor(s))
 
@@ -272,20 +282,34 @@ async def to_code(config):
     cg.add(var.set_task_core(config[CONF_TASK_CORE]))
     cg.add(var.set_is_high_freq(config[CONF_HIGH_FREQ]))
     cg.add(var.set_is_auto_start(config[CONF_AUTO_START]))
-    if CONF_MIC_SENSITIVITY in config:
-        cg.add(var.set_mic_sensitivity(config[CONF_MIC_SENSITIVITY]))
-    if CONF_MIC_SENSITIVITY_REF in config:
-        cg.add(var.set_mic_sensitivity_ref(config[CONF_MIC_SENSITIVITY_REF]))
-    if CONF_OFFSET in config:
-        cg.add(var.set_offset(config[CONF_OFFSET]))
+    if (mic_sensitivity := config.get(CONF_MIC_SENSITIVITY)) is not None:
+        cg.add(var.set_mic_sensitivity(mic_sensitivity))
+    if (mic_sensitivity_ref := config.get(CONF_MIC_SENSITIVITY_REF)) is not None:
+        cg.add(var.set_mic_sensitivity_ref(mic_sensitivity_ref))
+    if (offset := config.get(CONF_OFFSET)) is not None:
+        cg.add(var.set_offset(offset))
     if config[CONF_USE_ESP_DSP]:
         add_idf_component(name="espressif/esp-dsp", ref="1.7.0")
         cg.add_define("USE_ESP_DSP")
 
-    for fc in config[CONF_DSP_FILTERS]:
+    # Size the fixed-capacity containers before anything is registered into them: an
+    # add_*() call past the reserved count is rejected and logged, never silently dropped.
+    sensor_configs = config[CONF_SENSORS]
+    filter_configs = config[CONF_DSP_FILTERS]
+    total_filters = len(filter_configs) + sum(
+        1
+        for sc in sensor_configs
+        for fc in sc[CONF_DSP_FILTERS]
+        if isinstance(fc, dict)
+    )
+    cg.add(var.init_dsp_filters(total_filters))
+    if sensor_configs:
+        cg.add(var.init_sensors(len(sensor_configs)))
+
+    for fc in filter_configs:
         await add_dsp_filter(fc, var)
 
-    for sc in config[CONF_SENSORS]:
+    for sc in sensor_configs:
         await add_sensor(sc, var)
 
     ota.request_ota_state_listeners()

@@ -11,7 +11,7 @@ jobs:
     name: lint-and-compile
     runs-on: ubuntu-latest
     env:
-      ESPHOME_VERSION: 2026.3.0
+      ESPHOME_VERSION: 2026.6.5
       PLATFORMIO_LIBDEPS_DIR: ~/.platformio/libdeps
     strategy:
       fail-fast: false
@@ -39,7 +39,7 @@ jobs:
           python -m venv .venv
           source .venv/bin/activate
           pip install --upgrade pip
-          pip install esphome==${{ env.ESPHOME_VERSION }} yamllint pylint
+          pip install esphome==${{ env.ESPHOME_VERSION }} yamllint pylint clang-format==22.1.8
         if: steps.cache.outputs.cache-hit != 'true'
 
       - name: Init virtualenv
@@ -62,7 +62,7 @@ jobs:
 
       - name: Compile configs
         run: |
-          for f in configs/*-example-config.yaml
+          for f in $(git ls-files 'configs/*.yaml' | grep -v '/secrets\.yaml$')
           do
             sed 's!github://stas-sl/esphome-sound-level-meter!../components!' -i $f
             esphome compile $f

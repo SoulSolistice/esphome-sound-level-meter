@@ -19,6 +19,9 @@ endif()
 enable_testing()
 
 add_executable(dsp_math_tests test_dsp_math.cpp)
+target_include_directories(dsp_math_tests
+                           PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../components/sound_level_meter)
+target_compile_options(dsp_math_tests PRIVATE -Wall -Wextra -Werror)
 target_link_libraries(dsp_math_tests PRIVATE GTest::gtest GTest::gtest_main)
 
 include(GoogleTest)

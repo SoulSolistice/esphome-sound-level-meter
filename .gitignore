@@ -1,2 +1,4 @@
 .esphome
 __pycache__
+.venv/
+build/
