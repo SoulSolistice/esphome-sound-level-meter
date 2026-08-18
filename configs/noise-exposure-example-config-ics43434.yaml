@@ -1,0 +1,471 @@
+# yamllint disable rule:brackets rule:commas rule:line-length
+---
+# =============================================================================
+# Occupational noise-exposure meter - ICS-43434
+# =============================================================================
+#
+# Measures the quantities that noise-exposure assessment is actually defined on,
+# and derives daily exposure on-device. Frequency weighting (A and C) is the
+# psychoacoustic part: A-weighting approximates the 40-phon equal-loudness
+# contour, which is what every exposure standard below builds on.
+#
+# Standards this config implements
+# --------------------------------
+#   IEC 61672-1   A / C / Z frequency weighting, F / S exponential time weighting,
+#                 peak sound level. The A and C weighting filters below are within
+#                 Class 1 tolerances from 10 Hz to 20 kHz.
+#   ISO 9612      Determination of occupational noise exposure; LAeq,Te and the
+#                 normalisation to an 8 h working day.
+#   ISO 1999      L_EX,8h as the predictor of noise-induced hearing loss.
+#   IEC 61252     Sound exposure E in Pa^2*h, the dosimeter quantity.
+#   2003/10/EC    EU exposure action values, evaluated below as binary sensors:
+#                   lower action value  L_EX,8h = 80 dB(A)   LCpeak = 135 dB(C)
+#                   upper action value  L_EX,8h = 85 dB(A)   LCpeak = 137 dB(C)
+#                   limit value         L_EX,8h = 87 dB(A)   LCpeak = 140 dB(C)
+#   OSHA 1910.95  US dose with a 5 dB exchange rate and a 90 dB(A) criterion,
+#                 provided alongside the 3 dB (energy) dose used in the EU/ISO.
+#   ISO 4869-2    Octave-band levels 63 Hz .. 8 kHz, the band set that hearing
+#                 protector attenuation data is published for.
+#
+# What this hardware CANNOT do - read before relying on it
+# --------------------------------------------------------
+#   * The ICS-43434 has an acoustic overload point of 120 dB SPL. The peak action
+#     values of 2003/10/EC (135 / 137 / 140 dB(C)) are far above it, so this device
+#     CANNOT assess them - the microphone clips first. The LCpeak sensor is still
+#     published because it is meaningful well below the AOP, and the "Microphone
+#     overload" binary sensor tells you when you have run out of range. Peak
+#     criteria need a dedicated high-SPL instrument.
+#   * This is not a type-approved sound level meter or dosimeter. It is not
+#     periodically verified and has no acoustic calibrator input. Use it for
+#     monitoring and triage, not for legal compliance evidence.
+#   * ISO 532-1 loudness (sone) and DIN 45692 sharpness need 1/3-octave
+#     resolution - 28 bands, ~84 biquad sections - which does not fit the CPU
+#     budget alongside everything else here. Octave bands are provided instead;
+#     they are the correct input for ISO 4869-2, not for ISO 532-1.
+#   * Exposure accumulates in RAM. A reboot resets it. Trigger "Reset exposure"
+#     at the start of each shift.
+#
+# Calibration
+# -----------
+# mic_sensitivity / mic_sensitivity_ref below are the ICS-43434 datasheet figures
+# (-26 dBFS at 94 dB SPL, 1 kHz). Confirm against your own part, and use `offset`
+# to trim against a reference instrument. Datasheet SNR is 65 dB(A), so expect a
+# noise floor near 29 dB(A); readings close to that are the microphone, not the room.
+#
+# CPU budget at 240 MHz (from the benchmarks in the README): 32 biquad sections
+# plus 15 sensors is roughly 40 % of one core, or about 27 % with use_esp_dsp
+# enabled as it is below. Drop the octave bands if you only need exposure.
+# =============================================================================
+
+esphome:
+  name: noise-exposure-meter
+
+external_components:
+  - source: github://stas-sl/esphome-sound-level-meter
+
+esp32:
+  board: esp32dev
+  cpu_frequency: 240MHz
+  framework:
+    type: esp-idf
+
+logger:
+  level: INFO
+
+# see official docs https://esphome.io/components/i2s_audio.html
+i2s_audio:
+  i2s_lrclk_pin: GPIO18
+  i2s_bclk_pin: GPIO23
+
+# ICS-43434: 24-bit I2S data in a 32-bit frame. Tie the L/R pin low for the left channel.
+# see official docs https://esphome.io/components/microphone/i2s_audio
+microphone:
+  - platform: i2s_audio
+    id: mic
+    adc_type: external
+    i2s_din_pin: GPIO19
+    channel: left
+    sample_rate: 48000
+    bits_per_sample: 32bit
+    i2s_mode: primary
+
+sound_level_meter:
+  id: slm
+  microphone:
+    microphone: mic
+    bits_per_sample: 32
+
+  update_interval: 60s
+  auto_start: true
+  ring_buffer_size: 100ms
+  warmup_interval: 500ms
+
+  task_stack_size: 4096
+  task_priority: 2
+  task_core: 1
+
+  # ICS-43434 datasheet figures - see "Calibration" above
+  mic_sensitivity: -26dB
+  mic_sensitivity_ref: 94dB
+  offset: 0dB
+
+  # 32 biquad sections in total; the assembly implementation is worth having here
+  use_esp_dsp: true
+
+  dsp_filters:
+    # --- microphone equalisation -------------------------------------------
+    - id: f_ics43434          # ICS-43434 mic eq @ 48kHz
+      type: sos
+      coeffs:
+        #       b0           b1          b2          a1          a2
+        - [ 0.47732642,  0.46294358, 0.11224797, 0.06681948, 0.00111522]
+        - [ 1.,         -1.9890593 , 0.98908925, -1.9975533, 0.99755484]
+
+    # --- IEC 61672-1 frequency weighting ------------------------------------
+    - id: f_a                 # A weighting @ 48kHz, Class 1 from 10 Hz to 20 kHz
+      type: sos
+      coeffs:
+        #        b0            b1            b2            a1            a2
+        - [ 0.16999495  , 0.741029    , 0.52548885  , -0.11321865 , -0.056549273 ]
+        - [ 1.          , -2.00027    , 1.0002706   , -0.03433284 , -0.79215795  ]
+        - [ 1.          , -0.709303   , -0.29071867 , -1.9822421  , 0.9822986    ]
+    - id: f_c                 # C weighting @ 48kHz, Class 1 from 10 Hz to 20 kHz
+      type: sos
+      coeffs:
+        #        b0             b1             b2             a1             a2
+        - [ -0.49651518  , -0.12296628  , -0.0076134163, -0.37165618  , 0.03453208    ]
+        - [ 1.           , 1.3294908    , 0.44188643   , 1.2312505    , 0.37899444    ]
+        - [ 1.           , -2.          , 1.           , -1.9946145   , 0.9946217     ]
+
+    # --- ISO 4869-2 octave bands (63 Hz .. 8 kHz) ---------------------------
+    # Generated and validated by math/design_octave_bands.py --verify
+    # 6th-order Butterworth, unity gain at the midband frequency, -19.6 dB at the
+    # adjacent band centre. Measured band-level error is <= 0.25 dB on flat and
+    # pink spectra; a steeply sloped spectrum leaks more into the quiet bands.
+    - id: f_band_63          # 63 Hz octave band (44.2-88.4 Hz) @ 48kHz
+      type: sos
+      coeffs:
+        #          b0            b1            b2            a1            a2
+        - [2.40609183e-08, 4.81218367e-08, 2.40609183e-08,   -1.99416493,   0.994231665 ]
+        - [            1,             0,            -1,    -1.9961333,   0.996256459 ]
+        - [            1,            -2,             1,   -1.99793138,   0.997967646 ]
+    - id: f_band_125          # 125 Hz octave band (88.4-176.8 Hz) @ 48kHz
+      type: sos
+      coeffs:
+        #          b0            b1            b2            a1            a2
+        - [1.91381814e-07, 3.82763629e-07, 1.91381814e-07,   -1.98823023,   0.988496412 ]
+        - [            1,             0,            -1,   -1.99203538,     0.9925271 ]
+        - [            1,            -2,             1,   -1.99579442,   0.995939351 ]
+    - id: f_band_250          # 250 Hz octave band (176.8-353.6 Hz) @ 48kHz
+      type: sos
+      coeffs:
+        #          b0            b1            b2            a1            a2
+        - [1.51359356e-06, 3.02718713e-06, 1.51359356e-06,   -1.97606502,   0.977123644 ]
+        - [            1,             0,            -1,   -1.98315203,   0.985111368 ]
+        - [            1,            -2,             1,   -1.99131611,   0.991894625 ]
+    - id: f_band_500          # 500 Hz octave band (353.6-707.1 Hz) @ 48kHz
+      type: sos
+      coeffs:
+        #          b0            b1            b2            a1            a2
+        - [1.18364794e-05, 2.36729587e-05, 1.18364794e-05,   -1.95057274,   0.954758777 ]
+        - [            1,             0,            -1,   -1.96267882,   0.970454849 ]
+        - [            1,            -2,             1,   -1.98154606,    0.98385046 ]
+    - id: f_band_1000          # 1000 Hz octave band (707.1-1414.2 Hz) @ 48kHz
+      type: sos
+      coeffs:
+        #          b0            b1            b2            a1            a2
+        - [9.05521706e-05, 0.000181104341, 9.05521706e-05,   -1.89510912,   0.911473725 ]
+        - [            1,             0,            -1,   -1.91126554,   0.941863845 ]
+        - [            1,            -2,             1,   -1.95878761,   0.967926346 ]
+    - id: f_band_2000          # 2000 Hz octave band (1414.2-2828.4 Hz) @ 48kHz
+      type: sos
+      coeffs:
+        #          b0            b1            b2            a1            a2
+        - [0.000664487482, 0.00132897496, 0.000664487482,    -1.7675804,   0.830118681 ]
+        - [            1,             0,            -1,   -1.76958902,   0.887724605 ]
+        - [            1,            -2,             1,   -1.90070899,   0.936605396 ]
+    - id: f_band_4000          # 4000 Hz octave band (2828.4-5656.9 Hz) @ 48kHz
+      type: sos
+      coeffs:
+        #          b0            b1            b2            a1            a2
+        - [0.00452509323, 0.00905018645, 0.00452509323,   -1.45625701,   0.684545062 ]
+        - [            1,             0,            -1,   -1.35657615,   0.792589934 ]
+        - [            1,            -2,             1,   -1.73726088,   0.875099744 ]
+    - id: f_band_8000          # 8000 Hz octave band (5656.9-11313.7 Hz) @ 48kHz
+      type: sos
+      coeffs:
+        #          b0            b1            b2            a1            a2
+        - [ 0.0273747869,  0.0547495738,  0.0273747869,  -0.686226341,   0.440777309 ]
+        - [            1,             0,            -1,   -0.22598314,   0.661580149 ]
+        - [            1,            -2,             1,    -1.2523773,   0.749005065 ]
+
+  sensors:
+    # ======================= exposure core (A-weighted) =======================
+    # LAeq over the working day is what ISO 9612 / ISO 1999 / 2003/10/EC are
+    # defined on. The 1-minute sensor drives the exposure integration below.
+    - type: eq
+      name: LAeq 1min
+      id: laeq_1min
+      unit_of_measurement: dBA
+      dsp_filters: [f_ics43434, f_a]
+      on_value:
+        then:
+          - lambda: |-
+              if (std::isnan(x))
+                return;
+              // Sound exposure, ISO 9612 / IEC 61252: E = integral of p^2 dt, in Pa^2*s.
+              // p_ref = 20 uPa, so p_ref^2 = 4e-10 Pa^2.
+              const double pressure_squared = 4.0e-10 * std::pow(10.0, x / 10.0);
+              id(exposure_pa2s) += pressure_squared * 60.0;
+              id(exposure_seconds) += 60.0;
+              // OSHA 29 CFR 1910.95: 5 dB exchange rate, 90 dB(A) criterion for 8 h,
+              // levels below the 80 dB(A) threshold do not count towards the dose.
+              if (x >= 80.0) {
+                const double allowed_hours = 8.0 / std::pow(2.0, (x - 90.0) / 5.0);
+                id(osha_dose_pct) += (60.0 / 3600.0) / allowed_hours * 100.0;
+              }
+
+    # short-interval time history
+    - type: eq
+      name: LAeq 1s
+      id: laeq_1s
+      unit_of_measurement: dBA
+      update_interval: 1s
+      dsp_filters: [f_ics43434, f_a]
+
+    # IEC 61672-1 exponentially time-weighted maxima
+    - type: max
+      name: LAFmax 1min
+      id: lafmax_1min
+      time_weighting: fast
+      unit_of_measurement: dBA
+      dsp_filters: [f_ics43434, f_a]
+    - type: max
+      name: LASmax 1min
+      id: lasmax_1min
+      time_weighting: slow
+      unit_of_measurement: dBA
+      dsp_filters: [f_ics43434, f_a]
+
+    # ======================= C-weighted =======================================
+    # LCeq - LAeq is the HML / SNR indicator used when selecting hearing
+    # protection (ISO 4869-2); a large difference means low-frequency dominance.
+    - type: eq
+      name: LCeq 1min
+      id: lceq_1min
+      unit_of_measurement: dBC
+      dsp_filters: [f_ics43434, f_c]
+
+    # 2003/10/EC peak criteria are C-weighted. NOTE the AOP caveat in the header:
+    # this microphone saturates at 120 dB SPL, far below the 135 dB(C) action value.
+    - type: peak
+      name: LCpeak 1min
+      id: lcpeak_1min
+      unit_of_measurement: dBC
+      dsp_filters: [f_ics43434, f_c]
+
+    # ======================= range / overload =================================
+    # Deliberately unfiltered: this is the raw converter peak, so it reports when
+    # the microphone itself runs out of range. Full scale is 123 dB SPL peak.
+    - type: peak
+      name: Peak level (unweighted)
+      id: lzpeak_1min
+      unit_of_measurement: dBZ
+      dsp_filters: []
+
+    # ======================= ISO 4869-2 octave bands ==========================
+    # Unweighted band levels, as the octave-band method for hearing protector
+    # attenuation expects.
+    - type: eq
+      name: Octave 63 Hz
+      id: band_63
+      unit_of_measurement: dB
+      dsp_filters: [f_ics43434, f_band_63]
+    - type: eq
+      name: Octave 125 Hz
+      id: band_125
+      unit_of_measurement: dB
+      dsp_filters: [f_ics43434, f_band_125]
+    - type: eq
+      name: Octave 250 Hz
+      id: band_250
+      unit_of_measurement: dB
+      dsp_filters: [f_ics43434, f_band_250]
+    - type: eq
+      name: Octave 500 Hz
+      id: band_500
+      unit_of_measurement: dB
+      dsp_filters: [f_ics43434, f_band_500]
+    - type: eq
+      name: Octave 1 kHz
+      id: band_1000
+      unit_of_measurement: dB
+      dsp_filters: [f_ics43434, f_band_1000]
+    - type: eq
+      name: Octave 2 kHz
+      id: band_2000
+      unit_of_measurement: dB
+      dsp_filters: [f_ics43434, f_band_2000]
+    - type: eq
+      name: Octave 4 kHz
+      id: band_4000
+      unit_of_measurement: dB
+      dsp_filters: [f_ics43434, f_band_4000]
+    - type: eq
+      name: Octave 8 kHz
+      id: band_8000
+      unit_of_measurement: dB
+      dsp_filters: [f_ics43434, f_band_8000]
+
+# =============================================================================
+# Daily exposure, accumulated on-device
+# =============================================================================
+# Held in RAM only: writing to flash every minute would wear it out, so a reboot
+# restarts the shift. Press "Reset exposure" when a shift begins.
+globals:
+  - id: exposure_pa2s        # sound exposure E, Pa^2*s (IEC 61252)
+    type: double
+    restore_value: false
+    initial_value: '0.0'
+  - id: exposure_seconds     # measured duration Te, seconds
+    type: double
+    restore_value: false
+    initial_value: '0.0'
+  - id: osha_dose_pct        # OSHA 1910.95 dose, percent
+    type: double
+    restore_value: false
+    initial_value: '0.0'
+
+sensor:
+  # L_EX,8h = LAeq,Te + 10*log10(Te / T0), T0 = 8 h. Expanding LAeq,Te leaves the
+  # exposure integral over the 8 h reference duration (ISO 9612 clause 10).
+  - platform: template
+    name: LEX 8h
+    id: lex_8h
+    unit_of_measurement: dBA
+    device_class: sound_pressure
+    state_class: measurement
+    accuracy_decimals: 1
+    icon: mdi:ear-hearing
+    update_interval: 60s
+    lambda: |-
+      if (id(exposure_pa2s) <= 0.0)
+        return NAN;
+      return 10.0 * std::log10(id(exposure_pa2s) / (28800.0 * 4.0e-10));
+
+  # LAeq over everything measured so far, i.e. LAeq,Te
+  - platform: template
+    name: LAeq since reset
+    id: laeq_te
+    unit_of_measurement: dBA
+    device_class: sound_pressure
+    state_class: measurement
+    accuracy_decimals: 1
+    update_interval: 60s
+    lambda: |-
+      if (id(exposure_seconds) <= 0.0 || id(exposure_pa2s) <= 0.0)
+        return NAN;
+      return 10.0 * std::log10(id(exposure_pa2s) / (id(exposure_seconds) * 4.0e-10));
+
+  # Sound exposure in the dosimeter unit of IEC 61252
+  - platform: template
+    name: Sound exposure EA
+    id: exposure_ea
+    unit_of_measurement: "Pa²h"
+    state_class: total_increasing
+    accuracy_decimals: 4
+    update_interval: 60s
+    lambda: |-
+      return id(exposure_pa2s) / 3600.0;
+
+  # EU / ISO dose: 3 dB exchange rate against the 85 dB(A) upper action value.
+  # 85 dB(A) for 8 h corresponds to 3643 Pa^2*s (1.01 Pa^2*h).
+  - platform: template
+    name: Noise dose (EU, 85 dBA)
+    id: dose_eu
+    unit_of_measurement: "%"
+    state_class: total_increasing
+    accuracy_decimals: 1
+    icon: mdi:gauge
+    update_interval: 60s
+    lambda: |-
+      return 100.0 * id(exposure_pa2s) / 3642.94;
+
+  # US dose: 5 dB exchange rate, 90 dB(A) criterion (OSHA 29 CFR 1910.95).
+  - platform: template
+    name: Noise dose (OSHA, 90 dBA)
+    id: dose_osha
+    unit_of_measurement: "%"
+    state_class: total_increasing
+    accuracy_decimals: 1
+    icon: mdi:gauge
+    update_interval: 60s
+    lambda: |-
+      return id(osha_dose_pct);
+
+  # Low-frequency dominance indicator for protector selection (ISO 4869-2 HML)
+  - platform: template
+    name: LCeq minus LAeq
+    id: lc_minus_la
+    unit_of_measurement: dB
+    state_class: measurement
+    accuracy_decimals: 1
+    update_interval: 60s
+    lambda: |-
+      if (std::isnan(id(lceq_1min).state) || std::isnan(id(laeq_1min).state))
+        return NAN;
+      return id(lceq_1min).state - id(laeq_1min).state;
+
+binary_sensor:
+  - platform: template
+    name: Lower exposure action value exceeded
+    id: eav_lower
+    icon: mdi:alert-outline
+    lambda: |-
+      return !std::isnan(id(lex_8h).state) && id(lex_8h).state >= 80.0;
+
+  - platform: template
+    name: Upper exposure action value exceeded
+    id: eav_upper
+    icon: mdi:alert
+    lambda: |-
+      return !std::isnan(id(lex_8h).state) && id(lex_8h).state >= 85.0;
+
+  - platform: template
+    name: Exposure limit value exceeded
+    id: elv_exceeded
+    device_class: safety
+    lambda: |-
+      return !std::isnan(id(lex_8h).state) && id(lex_8h).state >= 87.0;
+
+  # Full scale is 123 dB SPL peak; flag before the converter actually clips, since
+  # a clipped reading is wrong but still looks plausible.
+  - platform: template
+    name: Microphone overload
+    id: mic_overload
+    device_class: problem
+    lambda: |-
+      return !std::isnan(id(lzpeak_1min).state) && id(lzpeak_1min).state >= 122.0;
+
+button:
+  - platform: template
+    name: Reset exposure
+    id: reset_exposure
+    icon: mdi:restart
+    on_press:
+      - lambda: |-
+          id(exposure_pa2s) = 0.0;
+          id(exposure_seconds) = 0.0;
+          id(osha_dose_pct) = 0.0;
+
+switch:
+  - platform: template
+    name: Measurement running
+    icon: mdi:power
+    restore_mode: DISABLED
+    lambda: |-
+      return id(slm).is_running();
+    turn_on_action:
+      - sound_level_meter.start
+    turn_off_action:
+      - sound_level_meter.stop

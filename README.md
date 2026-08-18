@@ -304,6 +304,44 @@ The exponential detector withholds its output for the first 5 τ after start so 
 cannot report a spurious minimum while settling — 0.6 s for Fast, 5 s for Slow. If your
 update_interval is shorter than that, the first interval after start publishes `NaN`.
 
+## Occupational noise exposure
+
+`configs/noise-exposure-example-config-ics43434.yaml` is a worked example aimed at
+noise-exposure assessment on an ICS-43434, rather than at general sound level metering.
+It measures the quantities the exposure standards are defined on and derives the daily
+exposure on-device:
+
+| Published value | Standard |
+|---|---|
+| LAeq (1 s and 1 min), LCeq | IEC 61672-1 |
+| LAFmax, LASmax | IEC 61672-1 exponential time weighting |
+| LCpeak | IEC 61672-1 (see the range limit below) |
+| L_EX,8h, LAeq,Te | ISO 9612, ISO 1999 |
+| Sound exposure E_A in Pa²h | IEC 61252 |
+| Noise dose, 3 dB exchange, 85 dB(A) criterion | 2003/10/EC |
+| Noise dose, 5 dB exchange, 90 dB(A) criterion | OSHA 29 CFR 1910.95 |
+| Octave-band levels, 63 Hz .. 8 kHz | ISO 4869-2 (hearing protector selection) |
+| LCeq − LAeq | ISO 4869-2 HML indicator |
+| Action-value binary sensors at 80 / 85 / 87 dB(A) | 2003/10/EC Article 3 |
+
+The exposure integration runs in ESPHome lambdas; `math/verify_exposure_math.py`
+checks it against exposure profiles whose answers follow from the definitions.
+The octave-band filters are generated and validated by
+`math/design_octave_bands.py --verify` (6th-order Butterworth, unity gain at the
+midband frequency, −19.6 dB at the adjacent band centre; measured band-level error
+≤ 0.25 dB on flat and pink spectra).
+
+**Range limit.** The ICS-43434's acoustic overload point is 120 dB SPL, so this
+hardware *cannot* assess the peak action values of 2003/10/EC (135 / 137 / 140 dB(C))
+— the microphone clips long before them. LCpeak is still useful well below that, and
+a "Microphone overload" binary sensor fires when the converter approaches full scale
+(123 dB SPL peak). This is a monitoring tool, not a type-approved dosimeter.
+
+**Not included.** ISO 532-1 loudness (sone) and DIN 45692 sharpness need 1/3-octave
+resolution — 28 bands, roughly 84 biquad sections — which does not fit the CPU budget
+alongside the weighting filters and exposure sensors. Octave bands are the correct
+input for ISO 4869-2, not for ISO 532-1.
+
 ## Measurement caveats
 
 - **Z-weighted readings are not band-limited.** IEC 61672-1 Z-weighting is flat from 10 Hz
